@@ -314,7 +314,21 @@ def layer_cape_isotherm(prof, temp_bottom, temp_top):
     -----
     The isotherm-bound pressures are interpolated from the reported levels via
     :func:`interp.pres_at_isotherm` (Requirement 19.3); the buoyancy integral is
-    delegated to the reference ``sharppy`` parcel ascent. Never raises.
+    delegated to the reference ``sharppy`` parcel ascent.
+
+    The HGZ layer sits *well above* the parcel's LCL. ``sharppy``'s
+    ``params.cape`` only integrates positive buoyancy correctly when its
+    ``pbot`` is at or below the LCL: when ``pbot`` is elevated it seeds the
+    moist ascent with the LCL parcel temperature *placed at* ``pbot``, yielding
+    a spuriously warm, hugely buoyant parcel (HGZ CAPE far exceeding the
+    profile's total CAPE). To avoid that, both buoyancy integrals are anchored
+    at the surface -- where ``cape`` is valid -- and differenced. Because
+    ``cape`` accumulates only positive layer contributions, the difference
+
+        CAPE(sfc -> -30 C) - CAPE(sfc -> -10 C)
+
+    is exactly the positive buoyancy the parcel gains *inside* the -10/-30 C
+    layer, i.e. HGZ CAPE as a subset of the parcel's total CAPE. Never raises.
     """
     pbot = interp.pres_at_isotherm(prof, temp_bottom)
     ptop = interp.pres_at_isotherm(prof, temp_top)
@@ -327,4 +341,32 @@ def layer_cape_isotherm(prof, temp_bottom, temp_top):
         # Degenerate: the colder isotherm is not above the warmer isotherm.
         return MISSING
 
-    return _layer_cape(prof, pbot, ptop)
+    # Anchor the parcel ascent at the surface so ``sharppy``'s cape() integrates
+    # the layer correctly (see Notes).
+    sfc = interp.pres_at_hght_agl(prof, 0.0)
+    if is_missing(sfc):
+        return MISSING
+    sfc = float(sfc)
+    if sfc <= ptop:
+        # The whole column is at/above the colder isotherm: no HGZ below its top.
+        return MISSING
+
+    # Positive buoyancy accumulated from the surface up to the cold (-30 C) bound.
+    cape_to_top = _layer_cape(prof, sfc, ptop)
+    if is_missing(cape_to_top):
+        return MISSING
+
+    # ...and up to the warm (-10 C) bound. When the surface is already at/above
+    # the warm isotherm, there is no sub-HGZ layer to subtract.
+    if sfc > pbot:
+        cape_to_bottom = _layer_cape(prof, sfc, pbot)
+        if is_missing(cape_to_bottom):
+            return MISSING
+    else:
+        cape_to_bottom = 0.0
+
+    hgz = float(cape_to_top) - float(cape_to_bottom)
+    if not np.isfinite(hgz):
+        return MISSING
+    # Clamp tiny negative residue from differencing two independent integrals.
+    return max(hgz, 0.0)

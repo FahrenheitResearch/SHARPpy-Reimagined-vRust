@@ -47,6 +47,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+import numpy as np
 from qtpy import QtCore, QtGui
 from qtpy.QtCore import QRect, Qt
 from qtpy.QtGui import QBrush, QColor, QFont, QPainter, QPen
@@ -62,6 +63,9 @@ __all__ = [
     "HGZOverlay",
     "draw_hgz_overlay",
     "SkewTHGZOverlayMixin",
+    "CAPE_FILL_COLOR",
+    "CIN_FILL_COLOR",
+    "draw_cape_fill",
 ]
 
 
@@ -84,6 +88,19 @@ HGZ_EDGE_COLOR = QColor(0, 200, 255, 100)
 
 #: Annotation text drawn alongside the band.
 _HGZ_LABEL = "HGZ"
+
+
+# ---------------------------------------------------------------------------
+# CAPE / CIN buoyancy-area fill styling
+# ---------------------------------------------------------------------------
+
+#: Translucent orange for positive buoyancy (CAPE) -- the area where the
+#: parcel's virtual temperature exceeds the environment's. The alpha keeps the
+#: temperature/parcel traces legible through the shading.
+CAPE_FILL_COLOR = QColor(255, 130, 0, 80)
+#: Translucent blue for negative buoyancy (CIN) -- the area where the parcel is
+#: colder than the environment.
+CIN_FILL_COLOR = QColor(30, 120, 255, 70)
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +136,17 @@ class HGZOverlay:
         pres_to_pix: Callable[[float], float],
         fill_color: Optional[QColor] = None,
         edge_color: Optional[QColor] = None,
+        draw_fill: bool = True,
     ) -> None:
         self.plot_rect = QRect(plot_rect)
         self.pres_to_pix = pres_to_pix
         self.fill_color = QColor(fill_color) if fill_color is not None else QColor(HGZ_FILL_COLOR)
         self.edge_color = QColor(edge_color) if edge_color is not None else QColor(HGZ_EDGE_COLOR)
+        #: When ``False`` the translucent band fill is skipped and only the
+        #: boundary isotherm lines + ``HGZ`` label are drawn. Used when the
+        #: CAPE/CIN buoyancy fill provides the primary shading and a second
+        #: translucent band over the same region would muddy it.
+        self.draw_fill = bool(draw_fill)
 
     # -- geometry ---------------------------------------------------------
 
@@ -197,10 +220,12 @@ class HGZOverlay:
             # 19.10: clip everything this pass draws to the plot rectangle.
             qp.setClipRect(QtCore.QRectF(self.plot_rect))
 
-            # Shaded fill across the full plot width.
-            qp.setPen(Qt.NoPen)
-            qp.setBrush(QBrush(self.fill_color))
-            qp.drawRect(band_rect)
+            # Shaded fill across the full plot width (skipped when the CAPE/CIN
+            # buoyancy fill is the primary shading -- boundaries/label stay).
+            if self.draw_fill:
+                qp.setPen(Qt.NoPen)
+                qp.setBrush(QBrush(self.fill_color))
+                qp.drawRect(band_rect)
 
             # Boundary lines at the -10 / -30 degrees C isotherms.
             pen = QPen(self.edge_color)
@@ -251,6 +276,7 @@ def draw_hgz_overlay(
     pres_to_pix: Callable[[float], float],
     fill_color: Optional[QColor] = None,
     edge_color: Optional[QColor] = None,
+    draw_fill: bool = True,
 ) -> bool:
     """Convenience wrapper: build an :class:`HGZOverlay` and draw it once.
 
@@ -261,8 +287,143 @@ def draw_hgz_overlay(
         pres_to_pix,
         fill_color=fill_color,
         edge_color=edge_color,
+        draw_fill=draw_fill,
     )
     return overlay.draw(qp, prof)
+
+
+# ---------------------------------------------------------------------------
+# CAPE / CIN buoyancy-area fill
+# ---------------------------------------------------------------------------
+
+def _finite_pair(values, pressures):
+    """Return ``(values, pressures)`` as aligned finite float arrays or ``None``.
+
+    Masked/NaN entries (and any level missing either coordinate) are dropped.
+    Returns ``None`` when fewer than two usable levels remain.
+    """
+    if values is None or pressures is None:
+        return None
+    v = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(values, dtype=float)), np.nan)
+    p = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(pressures, dtype=float)), np.nan)
+    v = np.ravel(v)
+    p = np.ravel(p)
+    if v.shape != p.shape or v.size < 2:
+        return None
+    keep = np.isfinite(v) & np.isfinite(p)
+    if np.count_nonzero(keep) < 2:
+        return None
+    return v[keep], p[keep]
+
+
+def _fill_poly(qp, color, points):
+    poly = QtGui.QPolygonF([QtCore.QPointF(float(px), float(py)) for px, py in points])
+    qp.setBrush(QBrush(color))
+    qp.drawPolygon(poly)
+
+
+def draw_cape_fill(
+    qp: QPainter,
+    parcel_tv,
+    parcel_p,
+    env_p,
+    env_tv,
+    plot_rect: QRect,
+    to_x: Callable,
+    to_y: Callable,
+    pos_color: Optional[QColor] = None,
+    neg_color: Optional[QColor] = None,
+) -> bool:
+    """Shade the buoyancy area between the parcel and environment traces.
+
+    The area between the parcel's virtual-temperature trace
+    (``parcel_tv`` at ``parcel_p``) and the environment's virtual-temperature
+    trace (``env_tv`` at ``env_p``) is filled per level-segment:
+
+    * **orange** (``pos_color`` / :data:`CAPE_FILL_COLOR`) where the parcel is
+      *warmer* than the environment -- positive buoyancy (CAPE), and
+    * **blue** (``neg_color`` / :data:`CIN_FILL_COLOR`) where the parcel is
+      *colder* -- negative buoyancy (CIN).
+
+    ``to_x(t, p)`` maps a (temperature C, pressure hPa) pair to an x pixel and
+    ``to_y(p)`` maps a pressure to a y pixel, both in ``plot_rect``'s coordinate
+    space (the SkewT widget's own composed transforms). Everything is clipped to
+    ``plot_rect``. Segments straddling the parcel/environment crossing (LFC, EL)
+    are split at the crossing so the orange/blue boundary lands exactly there.
+
+    Returns ``True`` when at least one area was filled, ``False`` otherwise
+    (missing/degenerate traces, or no vertical overlap). Never raises on bad
+    geometry beyond what the painter itself would.
+    """
+    pos_color = QColor(pos_color) if pos_color is not None else QColor(CAPE_FILL_COLOR)
+    neg_color = QColor(neg_color) if neg_color is not None else QColor(CIN_FILL_COLOR)
+
+    parcel = _finite_pair(parcel_tv, parcel_p)
+    env = _finite_pair(env_tv, env_p)
+    if parcel is None or env is None:
+        return False
+    p_tv, p_p = parcel
+    e_tv, e_p = env
+
+    # Interpolate the environment Tv onto the parcel's pressure levels. np.interp
+    # requires ascending sample coordinates; mark out-of-range as NaN so segments
+    # outside the sounding are skipped rather than clamped.
+    order = np.argsort(e_p)
+    env_on_parcel = np.interp(
+        p_p, e_p[order], e_tv[order], left=np.nan, right=np.nan
+    )
+    valid = np.isfinite(env_on_parcel)
+    if np.count_nonzero(valid) < 2:
+        return False
+
+    dt = p_tv - env_on_parcel  # >0 -> parcel warmer -> CAPE; <0 -> CIN
+    x_par = np.asarray(to_x(p_tv, p_p), dtype=float)
+    x_env = np.asarray(to_x(env_on_parcel, p_p), dtype=float)
+    y = np.asarray(to_y(p_p), dtype=float)
+
+    drew = False
+    qp.save()
+    try:
+        qp.setClipRect(QtCore.QRectF(plot_rect))
+        qp.setPen(Qt.NoPen)
+        for k in range(len(p_p) - 1):
+            if not (valid[k] and valid[k + 1]):
+                continue
+            d0 = float(dt[k])
+            d1 = float(dt[k + 1])
+            if d0 == 0.0 and d1 == 0.0:
+                continue
+            if d0 * d1 >= 0.0:
+                # Whole segment has one sign (treat a lone zero endpoint with
+                # its neighbour's sign).
+                color = pos_color if (d0 + d1) > 0.0 else neg_color
+                _fill_poly(qp, color, [
+                    (x_par[k], y[k]),
+                    (x_par[k + 1], y[k + 1]),
+                    (x_env[k + 1], y[k + 1]),
+                    (x_env[k], y[k]),
+                ])
+                drew = True
+            else:
+                # Sign change within the segment: split at the crossing, where
+                # the parcel and environment traces meet (dt == 0).
+                f = d0 / (d0 - d1)
+                ym = y[k] + f * (y[k + 1] - y[k])
+                xm = x_par[k] + f * (x_par[k + 1] - x_par[k])
+                _fill_poly(qp, pos_color if d0 > 0 else neg_color, [
+                    (x_par[k], y[k]),
+                    (xm, ym),
+                    (x_env[k], y[k]),
+                ])
+                _fill_poly(qp, pos_color if d1 > 0 else neg_color, [
+                    (xm, ym),
+                    (x_par[k + 1], y[k + 1]),
+                    (x_env[k + 1], y[k + 1]),
+                ])
+                drew = True
+    finally:
+        qp.restore()
+    return drew
 
 
 # ---------------------------------------------------------------------------

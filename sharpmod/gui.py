@@ -42,7 +42,7 @@ if os.environ.get("QT_QPA_PLATFORM", "offscreen") == "offscreen":
 os.environ.setdefault("QT_API", "pyside6")
 
 from qtpy.QtCore import (  # noqa: E402
-    Qt, QThread, Signal, QDate, QSettings, QPointF, QRectF, QSize,
+    Qt, QThread, QTimer, Signal, QDate, QSettings, QPointF, QRectF, QSize,
 )
 from qtpy.QtGui import (  # noqa: E402
     QAction, QPainter, QColor, QPen, QBrush, QPolygonF, QFont, QPixmap, QIcon,
@@ -330,6 +330,7 @@ def _ensure_setup(app) -> None:
     R._install_custom_barbs()
     R._install_hodo_0500()
     R._install_hodo_zoom()
+    R._install_hodo_interpolation_menu()
     R._install_hodo_label_fit()
     R._install_skewt_level_labels_fit()
     R._install_stp_condense()
@@ -879,6 +880,232 @@ def _install_export_menu(win, prof_col, controller) -> None:
 
 
 # ===========================================================================
+# Sounding availability pre-flight check (green / red / gray status)
+# ===========================================================================
+#: Availability states surfaced by :class:`_AvailabilityIndicator`.
+AVAIL_UNKNOWN = "unknown"          # not checked yet
+AVAIL_CHECKING = "checking"        # network probe in flight
+AVAIL_AVAILABLE = "available"      # green  -- a usable sounding exists
+AVAIL_INSUFFICIENT = "insufficient"  # gray -- present but corrupt/too sparse
+AVAIL_UNAVAILABLE = "unavailable"  # red   -- nothing archived / unreachable
+
+#: Dot color per state (green available, red unavailable, gray insufficient).
+_AVAIL_COLORS = {
+    AVAIL_UNKNOWN: "#6f7d8f",
+    AVAIL_CHECKING: "#e0a030",
+    AVAIL_AVAILABLE: "#3fbf5f",
+    AVAIL_INSUFFICIENT: "#9aa4b0",
+    AVAIL_UNAVAILABLE: "#e0433a",
+}
+
+#: Default label per state (overridable with a specific message).
+_AVAIL_LABELS = {
+    AVAIL_UNKNOWN: "Availability: not checked",
+    AVAIL_CHECKING: "Checking availability\u2026",
+    AVAIL_AVAILABLE: "Sounding available",
+    AVAIL_INSUFFICIENT: "Data incomplete \u2014 insufficient for full analysis",
+    AVAIL_UNAVAILABLE: "No sounding available",
+}
+
+#: Minimum decoded levels / moisture levels for a "best analysis" sounding.
+_AVAIL_MIN_THERMO_LEVELS = 6
+_AVAIL_MIN_MOISTURE_LEVELS = 3
+_AVAIL_MIN_PRESSURE_SPAN_HPA = 150.0
+
+
+def _station_label(station_id: str, name: str) -> str:
+    """Format a station's index + city, e.g. ``"72357 \u2014 OUN Norman, OK"``.
+
+    UWyo catalogue names are ``"<callsign> <city>, <state>"``; the id is the
+    WMO station index. Both are shown so the observation is unambiguous.
+    """
+    sid = str(station_id or "").strip()
+    city = str(name or "").strip()
+    if sid and city:
+        return f"{sid} \u2014 {city}"
+    return sid or city
+
+
+def _classify_availability(prof) -> tuple[str, str]:
+    """Grade a successfully fetched profile as green vs. gray.
+
+    A sounding that downloads and parses cleanly is still only useful for SPC
+    analysis if it has a reasonable vertical extent with temperature, moisture,
+    and wind. Returns ``(AVAIL_AVAILABLE | AVAIL_INSUFFICIENT, message)``.
+    """
+    import numpy as np
+
+    try:
+        def _valid(name):
+            arr = np.ma.masked_invalid(np.ma.asarray(getattr(prof, name),
+                                                      dtype=float))
+            return arr, np.ma.getmaskarray(arr)
+
+        pres, pmask = _valid("pres")
+        _tmpc, tmask = _valid("tmpc")
+        _dwpc, dmask = _valid("dwpc")
+        _wspd, wmask = _valid("wspd")
+    except Exception as exc:  # noqa: BLE001 - malformed profile => gray
+        return AVAIL_INSUFFICIENT, f"Sounding data could not be read: {exc}"
+
+    n_thermo = int(np.count_nonzero(~(pmask | tmask)))
+    n_moist = int(np.count_nonzero(~(pmask | dmask)))
+    n_wind = int(np.count_nonzero(~(pmask | wmask)))
+
+    if n_thermo < _AVAIL_MIN_THERMO_LEVELS:
+        return (AVAIL_INSUFFICIENT,
+                f"Only {n_thermo} temperature level(s) \u2014 too sparse for "
+                "analysis")
+
+    valid_pres = pres.compressed()
+    if valid_pres.size >= 2:
+        span = float(np.nanmax(valid_pres) - np.nanmin(valid_pres))
+        if span < _AVAIL_MIN_PRESSURE_SPAN_HPA:
+            return (AVAIL_INSUFFICIENT,
+                    f"Shallow profile (~{span:.0f} hPa deep) \u2014 insufficient "
+                    "for full analysis")
+
+    notes = []
+    if n_moist < _AVAIL_MIN_MOISTURE_LEVELS:
+        notes.append("little/no moisture data")
+    if n_wind < _AVAIL_MIN_MOISTURE_LEVELS:
+        notes.append("little/no wind data")
+    if notes:
+        return (AVAIL_INSUFFICIENT,
+                "Sounding present but " + " and ".join(notes)
+                + " \u2014 limited analysis")
+
+    return AVAIL_AVAILABLE, f"Sounding available ({n_thermo} levels)"
+
+
+class _AvailabilityWorker(QThread):
+    """Probe UWyo for a station/time and classify the result off the UI thread.
+
+    Emits :attr:`checked` with ``(station_id, when, status, message)`` where
+    ``status`` is one of the ``AVAIL_*`` constants. The full fetch is performed
+    (the availability of a *usable* sounding cannot be known without decoding
+    it), so this shares the exact retrieval/decode path as a real fetch.
+    """
+
+    #: (query, when, status, message, station_label). ``station_label`` is a
+    #: "index \u2014 city" string once the station resolves, else "".
+    checked = Signal(str, object, str, str, str)
+
+    def __init__(self, station_query: str, when_utc: datetime, token: int,
+                 parent=None):
+        super().__init__(parent)
+        self._query = station_query
+        self._when = when_utc
+        self.token = token
+
+    def run(self):  # noqa: D401 - QThread entry point
+        try:
+            StationLookupError, UWyo_Decoder, UWyoError = _uwyo_decoder_classes()
+        except Exception as exc:  # noqa: BLE001
+            self.checked.emit(self._query, self._when, AVAIL_UNAVAILABLE,
+                              f"UWyo decoder is unavailable: {exc}", "")
+            return
+
+        # Typed errors let us distinguish "nothing archived" (red) from
+        # "corrupt/unparseable" (gray). Missing imports degrade gracefully.
+        try:
+            from sharpmod.io.uwyo_decoder import (
+                RetrievalError,
+                SoundingParseError,
+                StationTimeUnavailableError,
+            )
+        except Exception:  # noqa: BLE001 - fall back to base-class handling
+            RetrievalError = SoundingParseError = StationTimeUnavailableError = ()
+
+        # Resolve the station first so its index + city can be reported in
+        # every outcome (available, unavailable, or insufficient).
+        try:
+            decoder = UWyo_Decoder(full_catalog=True)
+            meta = decoder.resolve_station(self._query)
+        except StationLookupError as exc:
+            self.checked.emit(self._query, self._when, AVAIL_UNAVAILABLE,
+                              f"Station lookup failed: {exc}", "")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.checked.emit(self._query, self._when, AVAIL_UNAVAILABLE,
+                              f"Station lookup failed: {exc}", "")
+            return
+
+        label = _station_label(meta.id, meta.name)
+
+        try:
+            prof = decoder.fetch(meta.id, self._when)
+        except SoundingParseError as exc:
+            self.checked.emit(self._query, self._when, AVAIL_INSUFFICIENT,
+                              f"Sounding data is corrupt/unparseable: {exc}",
+                              label)
+            return
+        except StationTimeUnavailableError as exc:
+            self.checked.emit(self._query, self._when, AVAIL_UNAVAILABLE,
+                              f"No sounding archived for this station/time: "
+                              f"{exc}", label)
+            return
+        except RetrievalError as exc:
+            self.checked.emit(self._query, self._when, AVAIL_UNAVAILABLE,
+                              f"UWyo service unreachable: {exc}", label)
+            return
+        except UWyoError as exc:
+            self.checked.emit(self._query, self._when, AVAIL_UNAVAILABLE,
+                              f"Fetch failed: {exc}", label)
+            return
+        except Exception as exc:  # noqa: BLE001 - never crash the UI thread
+            self.checked.emit(self._query, self._when, AVAIL_UNAVAILABLE,
+                              f"Unexpected error: {exc}", label)
+            return
+
+        status, message = _classify_availability(prof)
+        self.checked.emit(self._query, self._when, status, message, label)
+
+
+class _AvailabilityIndicator(QWidget):
+    """A colored dot + text reporting a station's sounding availability.
+
+    Shows the resolved station index and city on a header line (when known)
+    above the color-coded availability status.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        self._dot = QLabel()
+        self._dot.setFixedSize(14, 14)
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(1)
+        self._station = QLabel()
+        self._station.setWordWrap(True)
+        self._station.setStyleSheet("color:#d5e0ef; font-weight:bold;")
+        self._station.setVisible(False)
+        self._text = QLabel()
+        self._text.setWordWrap(True)
+        text_col.addWidget(self._station)
+        text_col.addWidget(self._text)
+        lay.addWidget(self._dot, 0, Qt.AlignTop)
+        lay.addLayout(text_col, 1)
+        self.set_status(AVAIL_UNKNOWN)
+
+    def set_status(self, status: str, message: str | None = None,
+                   station_label: str | None = None) -> None:
+        color = _AVAIL_COLORS.get(status, _AVAIL_COLORS[AVAIL_UNKNOWN])
+        self._dot.setStyleSheet(
+            f"background:{color}; border-radius:7px; border:1px solid #0c1118;")
+        label = (station_label or "").strip()
+        self._station.setText(label)
+        self._station.setVisible(bool(label))
+        text = message or _AVAIL_LABELS.get(status, "")
+        self._text.setText(text)
+        self._text.setStyleSheet(f"color:{color}; font-weight:bold;")
+        self.setToolTip(f"{label}\n{text}".strip() if label else text)
+
+
+# ===========================================================================
 # UWyo fetch worker (keeps the picker UI responsive during the network call)
 # ===========================================================================
 class _FetchWorker(QThread):
@@ -1369,6 +1596,21 @@ class PickerWindow(QMainWindow):
         self._settings = QSettings("SHARPpyReimagined", "GUI")
         self._all_stations = _uwyo_catalog().all_stations()
 
+        # -- availability pre-flight check state ----------------------------- #
+        # A background probe grades the selected station/time as green (usable),
+        # red (nothing archived / unreachable), or gray (present but too sparse
+        # or corrupt). Checks are debounced and stale results are discarded via
+        # a monotonically increasing token.
+        self._avail_workers: list[_AvailabilityWorker] = []
+        self._avail_pending: dict[int, _AvailabilityIndicator] = {}
+        self._avail_latest: dict[int, int] = {}
+        self._avail_token = 0
+        self._avail_request: tuple | None = None
+        self._avail_timer = QTimer(self)
+        self._avail_timer.setSingleShot(True)
+        self._avail_timer.setInterval(350)
+        self._avail_timer.timeout.connect(self._run_pending_availability)
+
         # The one shared render/display config, owned by the controller (this
         # window). Built lazily on first sounding/preference use so the picker
         # window appears before the heavy render stack is imported.
@@ -1469,6 +1711,59 @@ class PickerWindow(QMainWindow):
         return self.config
 
     # ====================================================================== #
+    # Availability pre-flight check (green / red / gray)
+    # ====================================================================== #
+    def _station_label_for(self, sid: str | None) -> str:
+        """Look up a station's index + city label from the loaded catalogue."""
+        if not sid:
+            return ""
+        st = next((s for s in self._all_stations if s["id"] == sid), None)
+        return _station_label(sid, st["name"] if st else "")
+
+    def _queue_availability(self, sid: str | None, when: datetime,
+                            indicator: "_AvailabilityIndicator") -> None:
+        """Debounce, then probe ``sid`` at ``when`` and update ``indicator``."""
+        if not sid:
+            indicator.set_status(AVAIL_UNKNOWN)
+            return
+        indicator.set_status(
+            AVAIL_CHECKING,
+            f"Checking availability at {when:%Y-%m-%d %H}Z\u2026",
+            self._station_label_for(sid))
+        self._avail_request = (sid, when, indicator)
+        self._avail_timer.start()
+
+    def _run_pending_availability(self) -> None:
+        if not self._avail_request:
+            return
+        sid, when, indicator = self._avail_request
+        self._avail_request = None
+        self._avail_token += 1
+        token = self._avail_token
+        self._avail_pending[token] = indicator
+        self._avail_latest[id(indicator)] = token
+
+        worker = _AvailabilityWorker(sid, when, token, parent=self)
+        worker.checked.connect(self._on_availability_checked)
+        worker.finished.connect(worker.deleteLater)
+        self._avail_workers.append(worker)
+        worker.start()
+
+    def _on_availability_checked(self, _sid: str, _when, status: str,
+                                 message: str, station_label: str) -> None:
+        worker = self.sender()
+        token = getattr(worker, "token", None)
+        indicator = self._avail_pending.pop(token, None)
+        if worker in self._avail_workers:
+            self._avail_workers.remove(worker)
+        if indicator is None:
+            return
+        # Discard results superseded by a newer check for the same indicator.
+        if self._avail_latest.get(id(indicator)) != token:
+            return
+        indicator.set_status(status, message, station_label)
+
+    # ====================================================================== #
     # Station Map tab (legacy-SHARPpy style)
     # ====================================================================== #
     def _build_map_tab(self) -> QWidget:
@@ -1539,6 +1834,21 @@ class PickerWindow(QMainWindow):
         self._map_sel_lbl.setStyleSheet("font-weight: bold;")
         left.addWidget(self._map_sel_lbl)
 
+        avail_box = QGroupBox("Availability")
+        avb = QVBoxLayout(avail_box)
+        self._map_avail = _AvailabilityIndicator()
+        avb.addWidget(self._map_avail)
+        recheck = QToolButton()
+        recheck.setText("Check now")
+        recheck.clicked.connect(self._map_recheck_availability)
+        avb.addWidget(recheck, 0, Qt.AlignLeft)
+        left.addWidget(avail_box)
+
+        # Re-probe when the requested cycle changes for the current selection.
+        self._map_date.dateChanged.connect(self._map_recheck_availability)
+        self._map_cycle.currentIndexChanged.connect(
+            self._map_recheck_availability)
+
         left.addStretch(1)
 
         self._map_gen_btn = QPushButton("Generate Sounding")
@@ -1588,6 +1898,11 @@ class PickerWindow(QMainWindow):
             self._map_sel_lbl.setText(sid)
         self._map_gen_btn.setEnabled(
             not (self._worker is not None and self._worker.isRunning()))
+        self._queue_availability(sid, self._map_when(), self._map_avail)
+
+    def _map_recheck_availability(self) -> None:
+        self._queue_availability(
+            self._map_selected_id, self._map_when(), self._map_avail)
 
     def _map_on_activate(self, sid: str) -> None:
         self._map_on_select(sid)
@@ -1668,6 +1983,16 @@ class PickerWindow(QMainWindow):
         tg.addWidget(self._valid_lbl, 2, 0, 1, 3)
         layout.addWidget(time_box)
 
+        # --- Availability pre-flight ---
+        avail_row = QHBoxLayout()
+        self._uwyo_avail = _AvailabilityIndicator()
+        avail_row.addWidget(self._uwyo_avail, 1)
+        uwyo_recheck = QToolButton()
+        uwyo_recheck.setText("Check now")
+        uwyo_recheck.clicked.connect(self._uwyo_recheck_availability)
+        avail_row.addWidget(uwyo_recheck, 0, Qt.AlignRight)
+        layout.addLayout(avail_row)
+
         # --- Primary action ---
         self._fetch_btn = QPushButton("Fetch && Display Sounding")
         self._fetch_btn.setDefault(True)
@@ -1675,11 +2000,23 @@ class PickerWindow(QMainWindow):
         self._fetch_btn.clicked.connect(self._fetch_selected)
         layout.addWidget(self._fetch_btn)
 
+        # Re-probe availability when the selection or requested cycle changes.
+        self._station_list.itemSelectionChanged.connect(
+            self._uwyo_recheck_availability)
+        self._date_edit.dateChanged.connect(self._uwyo_recheck_availability)
+        self._cycle_combo.currentIndexChanged.connect(
+            self._uwyo_recheck_availability)
+
         # Populate the full catalogue now; live-filter narrows it.
         self._filter_stations("")
         self._update_valid_label()
         self._sync_fetch_enabled()
         return w
+
+    def _uwyo_recheck_availability(self) -> None:
+        self._queue_availability(
+            self._selected_station_id(), self._selected_when(),
+            self._uwyo_avail)
 
     # -- station list -------------------------------------------------------- #
     def _filter_stations(self, text: str) -> None:

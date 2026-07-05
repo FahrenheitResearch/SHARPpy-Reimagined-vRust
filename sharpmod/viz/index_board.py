@@ -87,6 +87,10 @@ def f1(x):
     return MISS if x is None else "%.1f" % x
 
 
+def f2(x):
+    return MISS if x is None else "%.2f" % x
+
+
 def dirspd(v):
     if not isinstance(v, (tuple, list)) or len(v) < 2:
         return MISS
@@ -580,8 +584,8 @@ class IndexBoard(QFrame):
 
         # Temperatures come from the SHARPpy profile in Fahrenheit.
         tsym = "\u00b0F"
-        col1 = [("PWAT", suf(f1(self._sf("pwat")), " in")),
-                ("MeanW", f1(self._sf("mean_mixr"))),
+        col1 = [("PWAT", suf(f2(self._sf("pwat")), " in")),
+                ("MeanW", suf(f2(self._sf("mean_mixr")), " g/kg")),
                 ("LowRH", suf(i0(self._sf("low_rh")), "%")),
                 ("MidRH", suf(i0(self._sf("mid_rh")), "%")),
                 ("DCAPE", i0(self._sf("dcape"))),
@@ -589,7 +593,7 @@ class IndexBoard(QFrame):
         col2 = [("K", i0(self._sf("k_idx"))), ("TT", i0(self._sf("totals_totals"))),
                 ("ConvT", suf(i0(self._sf("convT")), tsym)),
                 ("MaxT", suf(i0(self._sf("maxT")), tsym)),
-                ("ESP", f1(self._sf("esp"))), ("MMP", f1(self._sf("mmp")))]
+                ("ESP", f1(self._sf("esp"))), ("MMP", f2(self._sf("mmp")))]
         b3 = self._p("mlpcl", "b3km")
         b6 = self._p("mlpcl", "b6km")
         col3 = [("WNDG", f1(self._sf("wndg"))), ("TEI", i0(self._sf("tei"))),
@@ -652,9 +656,15 @@ class IndexBoard(QFrame):
             if v is None:
                 return self.fg
             try:
-                return QtGui.QColor(colors.tier_color(param, v))
+                hexc = colors.tier_color(param, v)
             except Exception:
                 return self.fg
+            # The documented top tier is a dark purple that reads poorly on
+            # black; surface the most extreme values as pink instead (matching
+            # the SCP / LRGHAIL recolor).
+            if hexc == colors.ALERT_TIERS[6]:
+                return QtGui.QColor(PINK)
+            return QtGui.QColor(hexc)
 
         scp_v = self._sf("right_scp")
         stpc_v = self._sf("stp_cin")
@@ -855,7 +865,7 @@ class IndexBoard(QFrame):
         # CAPE-energy rows use the white->yellow->red->pink scale; WBZ is neutral.
         bot = [("HGZ CAPE", i0(hgz), " J/kg",
                 self._wyrp(hgz, 1000, 2500, 4000, higher=True)),
-               ("NCAPE", f1(ncape), " J/kg/m",
+               ("NCAPE", f2(ncape), " J/kg/m",
                 self._wyrp(ncape, 0.1, 0.2, 0.3, higher=True)),
                ("WBZ Height", i0(wbz), " m AGL", self.fg),
                ("ECAPE", i0(ecape), " J/kg",

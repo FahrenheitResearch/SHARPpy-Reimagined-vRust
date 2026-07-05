@@ -132,6 +132,27 @@ def test_spc_hrrr_point_decodes_to_populated_profile():
     _assert_populated(prof)
 
 
+@pytest.mark.skipif(not SPC_HRRR.exists(), reason="no SPC .spc example file")
+def test_spc_raw_column_header_is_ignored(tmp_path):
+    """SPC text with a column-name row inside %RAW% does not add a nan level."""
+    original = _decode_spc(SPC_HRRR)
+    text = SPC_HRRR.read_text()
+    text = text.replace(
+        "%RAW%\n",
+        "%RAW%\n   PRES,   HGHT,   TEMP,   DWPT,   WDIR,   WSPD\n",
+        1,
+    )
+    path = tmp_path / "spc_raw_header.txt"
+    path.write_text(text)
+
+    prof = _decode_spc(path)
+    _assert_populated(prof)
+    assert len(prof.pres) == len(original.pres)
+
+    pres = np.asarray(ma.asarray(prof.pres).filled(np.nan), dtype=float)
+    assert np.isfinite(pres).all()
+
+
 # --------------------------------------------------------------------------- #
 # 12.2 BUFKIT
 # --------------------------------------------------------------------------- #

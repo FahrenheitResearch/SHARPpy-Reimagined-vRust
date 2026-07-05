@@ -150,6 +150,112 @@ def _bridge_legacy_decoder_base():
         sys.modules['sharppy.io.decoder'] = sys.modules[__name__]
 
 
+def _sanitize_profile_rows(prof):
+    """Normalize SPC rows that decoded as ``nan`` instead of missing values.
+
+    Some high-resolution SPC-style exports include a column-name row immediately
+    after ``%RAW%``. The vendored SPC decoder feeds that line to ``genfromtxt``,
+    producing an all-``nan`` level. Raw profiles tolerate it, but the later
+    convective-profile upgrade can fail on NumPy mask length mismatches. Keep
+    rows with finite pressure/height and convert any remaining non-finite cell
+    to SHARPpy's missing-value sentinel.
+    """
+    if not hasattr(prof, "pres") or not hasattr(prof, "hght"):
+        return
+
+    missing = float(getattr(prof, "missing", -9999.0))
+    pres = np.ma.asarray(prof.pres, dtype=float)
+    hght = np.ma.asarray(prof.hght, dtype=float)
+    if pres.ndim != 1 or hght.ndim != 1 or len(pres) != len(hght):
+        return
+
+    pres_values = np.asarray(pres.filled(np.nan), dtype=float)
+    hght_values = np.asarray(hght.filled(np.nan), dtype=float)
+    keep = np.isfinite(pres_values) & np.isfinite(hght_values)
+    if keep.size == 0 or not np.any(keep):
+        return
+
+    for name in (
+        "pres", "hght", "tmpc", "dwpc", "wdir", "wspd", "u", "v",
+        "omeg", "tmp_stdev", "dew_stdev",
+    ):
+        arr = getattr(prof, name, None)
+        if arr is None:
+            continue
+        marr = np.ma.asarray(arr, dtype=float)
+        if marr.ndim != 1 or len(marr) != len(keep):
+            continue
+        values = np.asarray(marr.filled(missing), dtype=float)[keep]
+        values[~np.isfinite(values)] = missing
+        setattr(prof, name, np.ma.masked_values(values, missing))
+
+
+def _max_spc_profile_levels():
+    """Return the plotting-safe cap for very dense SPC profiles."""
+    try:
+        value = int(os.environ.get("SHARPMOD_MAX_SPC_LEVELS", "700"))
+    except ValueError:
+        value = 700
+    return max(50, value)
+
+
+def _thin_profile_rows(prof):
+    """Downsample extremely dense SPC profiles before SHARPpy widget plotting."""
+    max_levels = _max_spc_profile_levels()
+    pres = getattr(prof, "pres", None)
+    if pres is None:
+        return
+    try:
+        count = len(pres)
+    except TypeError:
+        return
+    if count <= max_levels:
+        return
+
+    indexes = np.unique(np.rint(
+        np.linspace(0, count - 1, max_levels)
+    ).astype(int))
+
+    for name in (
+        "pres", "hght", "tmpc", "dwpc", "wdir", "wspd", "u", "v",
+        "omeg", "tmp_stdev", "dew_stdev",
+    ):
+        arr = getattr(prof, name, None)
+        if arr is None:
+            continue
+        marr = np.ma.asarray(arr)
+        if marr.ndim != 1 or len(marr) != count:
+            continue
+        setattr(prof, name, marr[indexes])
+
+
+def _sanitize_profile_collection(prof_col):
+    """Apply row sanitation to every raw profile in a ProfCollection."""
+    for profs in getattr(prof_col, "_profs", {}).values():
+        for prof in profs:
+            _sanitize_profile_rows(prof)
+            _thin_profile_rows(prof)
+    return prof_col
+
+
+def _wrap_spc_decoder():
+    """Wrap the vendored SPC decoder with SHARPpy Reimagined row sanitation."""
+    spc_cls = _decoders.get("spc")
+    if spc_cls is None or getattr(spc_cls, "_sharpmod_sanitized", False):
+        return
+
+    class SanitizedSPCDecoder(spc_cls):
+        _sharpmod_sanitized = True
+
+        def _parse(self):
+            return _sanitize_profile_collection(super()._parse())
+
+    SanitizedSPCDecoder.__name__ = spc_cls.__name__
+    SanitizedSPCDecoder.__qualname__ = spc_cls.__qualname__
+    SanitizedSPCDecoder.__module__ = spc_cls.__module__
+    _decoders["spc"] = SanitizedSPCDecoder
+
+
 def findDecoders():
     """Discover and register the built-in and custom decoders.
 
@@ -174,6 +280,8 @@ def findDecoders():
         dec_mod_name = os.path.basename(dec)[:-3]
         logger.debug("Found custom decoder '%s'.", dec_mod_name)
         _register(_load_source(dec_mod_name, dec))
+
+    _wrap_spc_decoder()
 
 
 def getDecoder(dec_name):

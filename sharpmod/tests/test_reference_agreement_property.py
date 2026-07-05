@@ -459,12 +459,30 @@ def _ref_ncin(snd, sp):
 
 
 def _ref_hgz_cape(snd, sp):
+    # HGZ CAPE is the positive buoyancy a surface parcel gains *inside* the
+    # -10/-30 C layer. sharppy's cape() only integrates correctly when pbot is
+    # at/below the LCL, so anchor both integrals at the surface and difference
+    # them (see layer_cape_isotherm Notes for why an elevated pbot inflates the
+    # result). CAPE(sfc->-30) - CAPE(sfc->-10) isolates the in-layer positive
+    # buoyancy because cape() accumulates only positive contributions.
     from sharppy.sharptab import params as sp_params
-    pbot = _finite(sp_params.temp_lvl(sp, -10))
-    ptop = _finite(sp_params.temp_lvl(sp, -30))
+    pbot = _finite(sp_params.temp_lvl(sp, -10))  # warm bound (higher pressure)
+    ptop = _finite(sp_params.temp_lvl(sp, -30))  # cold bound (lower pressure)
     if pbot is None or ptop is None or pbot <= ptop:
         return None
-    return _finite(sp_params.cape(sp, pbot=pbot, ptop=ptop).bplus)
+    sfc = float(sp.pres[sp.sfc])
+    if sfc <= ptop:
+        return None
+    cape_to_top = _finite(sp_params.cape(sp, pbot=sfc, ptop=ptop).bplus)
+    if cape_to_top is None:
+        return None
+    if sfc > pbot:
+        cape_to_bottom = _finite(sp_params.cape(sp, pbot=sfc, ptop=pbot).bplus)
+        if cape_to_bottom is None:
+            return None
+    else:
+        cape_to_bottom = 0.0
+    return max(cape_to_top - cape_to_bottom, 0.0)
 
 
 def _ref_cape_0_6km(snd, sp):

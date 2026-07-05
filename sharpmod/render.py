@@ -2157,6 +2157,114 @@ def _install_hodo_zoom():
         pass
 
 
+def _install_hodo_interpolation_menu():
+    """Add focused-profile interpolation controls to the hodograph menu.
+
+    Upstream exposes ``Interpolate Focused Profile`` / ``Reset Interpolation``
+    only from the main Profiles menu and the ``I`` shortcut. The hodograph
+    already has a right-click menu for cursor/centering/reset controls, so add
+    the same focused-profile interpolation action there and route it through
+    the owning ``SPCWindow``. Calling the window-level methods keeps the main
+    Profiles menu visibility in sync with the current interpolation state.
+    """
+    try:
+        import sharppy.viz.hodo as _hodo_mod
+
+        _plot = _hodo_mod.plotHodo
+        if getattr(_plot, "_sharpmod_interp_menu", False):
+            return
+
+        _QtWidgets = _hodo_mod.QtWidgets
+
+        def _owner(widget):
+            candidates = []
+            try:
+                candidates.append(widget.window())
+            except Exception:
+                pass
+
+            cur = widget
+            for _ in range(12):
+                if cur is None:
+                    break
+                candidates.append(cur)
+                try:
+                    cur = cur.parentWidget()
+                except Exception:
+                    break
+
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                if (hasattr(candidate, "interpProf")
+                        and hasattr(candidate, "resetProf")
+                        and hasattr(candidate, "spc_widget")):
+                    return candidate
+            return None
+
+        def _is_interpolated(widget):
+            win = _owner(widget)
+            try:
+                return bool(win.spc_widget.isInterpolated())
+            except Exception:
+                return False
+
+        def _interpolate(widget):
+            win = _owner(widget)
+            if win is not None:
+                win.interpProf()
+
+        def _reset(widget):
+            win = _owner(widget)
+            if win is not None:
+                win.resetProf()
+
+        def _sync(widget):
+            try:
+                interp = _is_interpolated(widget)
+                widget.sharpmod_hodo_interp_action.setVisible(not interp)
+                widget.sharpmod_hodo_reset_interp_action.setVisible(interp)
+            except Exception:
+                pass
+
+        _orig_init = _plot.__init__
+
+        def __init__(self, **kwargs):
+            _orig_init(self, **kwargs)
+            if hasattr(self, "sharpmod_hodo_interp_action"):
+                return
+
+            try:
+                self.popupmenu.addSeparator()
+
+                interp_action = _QtWidgets.QAction(
+                    "Interpolate Focused Profile", self)
+                interp_action.triggered.connect(lambda: _interpolate(self))
+                self.popupmenu.addAction(interp_action)
+
+                reset_action = _QtWidgets.QAction("Reset Interpolation", self)
+                reset_action.triggered.connect(lambda: _reset(self))
+                reset_action.setVisible(False)
+                self.popupmenu.addAction(reset_action)
+
+                self.sharpmod_hodo_interp_action = interp_action
+                self.sharpmod_hodo_reset_interp_action = reset_action
+            except Exception:
+                pass
+
+        _orig_show = _plot.showCursorMenu
+
+        def showCursorMenu(self, pos):
+            _sync(self)
+            return _orig_show(self, pos)
+
+        _plot.__init__ = __init__
+        _plot.showCursorMenu = showCursorMenu
+        _plot._sharpmod_interp_menu = True
+    except Exception:  # pragma: no cover - vendored module always present
+        pass
+
+
 # Maximum point size for the hodograph label font (RM/LM storm motion labels).
 HODO_LABEL_MAX_PT = int(os.environ.get("HODO_LABEL_MAX_PT", "8"))
 # Maximum point size for the hodograph readout font (cursor wind readout).
@@ -3335,6 +3443,7 @@ def render(infile: str, outfile: str = "sharpmod_sounding.png",
         _install_custom_barbs()
         _install_hodo_0500()
         _install_hodo_zoom()
+        _install_hodo_interpolation_menu()
         _install_hodo_label_fit()
         _install_skewt_level_labels_fit()
         # Condense the vendored STP graphic fonts before it is constructed.

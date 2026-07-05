@@ -13,6 +13,9 @@ from .skew import (
     draw_hgz_overlay,
     HGZ_TOP_ISOTHERM,
     HGZ_BOTTOM_ISOTHERM,
+    CAPE_FILL_COLOR,
+    CIN_FILL_COLOR,
+    draw_cape_fill,
 )
 from .ship import plotSHIP, SHIP_SCALE_MIN, SHIP_SCALE_MAX
 from .thermo import (
@@ -30,6 +33,10 @@ __all__ = [
     "draw_hgz_overlay",
     "HGZ_TOP_ISOTHERM",
     "HGZ_BOTTOM_ISOTHERM",
+    # Skew-T CAPE/CIN buoyancy-area fill
+    "CAPE_FILL_COLOR",
+    "CIN_FILL_COLOR",
+    "draw_cape_fill",
     # SHIP chart inset (task 14.1)
     "plotSHIP",
     "SHIP_SCALE_MIN",

@@ -129,7 +129,10 @@ _ALERT_PALETTE = (
     ("alert_l3_color", "#ffff00", "#ffff00"),  # 3 - yellow
     ("alert_l4_color", "#ff0000", "#ff0000"),  # 4 - red
     ("alert_l5_color", "#e700df", "#e700df"),  # 5 - magenta
-    ("alert_l6_color", "#ad00e7", "#ad00e7"),  # 6 - purple
+    # 6 - top tier. The legacy dark purple (#ad00e7) reads poorly on the black
+    # chart background, so the modernized scheme surfaces the most extreme tier
+    # as bright pink instead (matches the SCP / STP / LRGHAIL recolor).
+    ("alert_l6_color", "#ad00e7", "#ff00ff"),  # 6 - pink (was purple)
 )
 
 #: Legacy alert tier palette, indexed 0..6.

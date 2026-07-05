@@ -153,6 +153,43 @@ def _patch_methods() -> None:
             except (AttributeError, TypeError):
                 pass
 
+    # QWheelEvent.delta() -> angleDelta().y() (removed in Qt6). The vendored
+    # Skew-T (``plotSkewT`` / ``backgroundSkewT``) and hodograph
+    # (``backgroundHodo``) ``wheelEvent`` handlers still call ``e.delta()`` to
+    # drive mouse-wheel zoom; without this the call raises ``AttributeError``
+    # inside the Qt event handler and wheel zoom silently does nothing.
+    wheel_cls = QtGui.QWheelEvent
+    if not hasattr(wheel_cls, "delta") and hasattr(wheel_cls, "angleDelta"):
+        def _wheel_delta(self):
+            pt = self.angleDelta()
+            # Qt5 delta() returned the vertical scroll amount; fall back to the
+            # horizontal axis only when there is no vertical component.
+            return pt.y() if pt.y() != 0 else pt.x()
+
+        _wheel_delta._sharpmod_shim = True
+        try:
+            wheel_cls.delta = _wheel_delta
+        except (AttributeError, TypeError):
+            pass
+
+    # QWheelEvent.x()/y() -> position().x()/y() (removed in Qt6). The vendored
+    # Skew-T ``backgroundSkewT.wheelEvent`` reads ``e.x()``/``e.y()`` to zoom
+    # about the cursor, so these must resolve for wheel zoom to work.
+    if not hasattr(wheel_cls, "x") and hasattr(wheel_cls, "position"):
+        def _wheel_x(self):
+            return int(self.position().x())
+
+        def _wheel_y(self):
+            return int(self.position().y())
+
+        _wheel_x._sharpmod_shim = True
+        _wheel_y._sharpmod_shim = True
+        try:
+            wheel_cls.x = _wheel_x
+            wheel_cls.y = _wheel_y
+        except (AttributeError, TypeError):
+            pass
+
     # QFont(family, size, bold=..., italic=...): PySide2 accepted Q_PROPERTY
     # keyword arguments in the constructor; PySide6 rejects unknown kwargs.
     # Translate the ones the vendored widgets pass into post-construction
@@ -297,6 +334,7 @@ def apply() -> bool:
     _patch_numpy_aliases()
     _patch_sharppy_pwv_climo()
     _patch_inset_layout()
+    _patch_inset_readout()
     _APPLIED = True
     return True
 
@@ -319,4 +357,25 @@ def _patch_inset_layout() -> None:
         _apply_inset_layout()
     except Exception:
         # A label-layout fix must never abort the core Qt6/NumPy shim.
+        pass
+
+
+def _patch_inset_readout() -> None:
+    """Add hover cursor readouts to the Storm Slinky / Theta-E / SR-Wind insets.
+
+    Unlike the Skew-T and hodograph, the vendored bottom insets have no cursor
+    readout. :func:`sharpmod.viz.inset_readout.apply` patches the vendored
+    ``plot*`` inset classes so hovering shows the value under the cursor
+    (theta-e at a pressure, SR wind speed at a height, and the nearest slinky
+    ring's height). It is best-effort and a no-op when the upstream inset
+    modules are unavailable.
+    """
+    try:
+        from sharpmod.viz.inset_readout import apply as _apply_inset_readout
+    except Exception:
+        return
+    try:
+        _apply_inset_readout()
+    except Exception:
+        # A readout add-on must never abort the core Qt6/NumPy shim.
         pass

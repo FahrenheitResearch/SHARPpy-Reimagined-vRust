@@ -75,6 +75,10 @@ def _fmt1(f):
     return f"{f:.1f}"
 
 
+def _fmt2(f):
+    return f"{f:.2f}"
+
+
 class ParamBoard(QFrame):
     """Full-width board of outlined, titled parameter group boxes."""
 
@@ -170,13 +174,13 @@ class ParamBoard(QFrame):
             E("ECAPE", _scalar(self._dp("ecape")), _fmt0, "cape"),
             E("DCAPE", _scalar(self._sp("dcape")), _fmt0, None),
             E("MUCIN", _scalar(self._parcel("mupcl", "bminus")), _fmt0, "cinh"),
-            E("NCAPE", _scalar(self._dp("ncape")), _fmt1, None),
+            E("NCAPE", _scalar(self._dp("ncape")), _fmt2, None),
             E("WBZ Height", _scalar(self._dp("wbz_height")), _fmt0, None),
         ]))
 
         # Moisture / Lapse rates ----------------------------------------
         groups.append(("Moisture / Lapse", [
-            E("PW (in)", _scalar(self._sp("pwat")), _fmt1, None),
+            E("PW (in)", _scalar(self._sp("pwat")), _fmt2, None),
             E("K-index", _scalar(self._sp("k_idx")), _fmt0, None),
             E("SFC-1km LR", _scalar(self._dp("lapserate_sfc_1km")), _fmt1, "lapse_rate"),
             E("SFC-3km LR", _scalar(self._sp("lapserate_3km")), _fmt1, "lapse_rate"),

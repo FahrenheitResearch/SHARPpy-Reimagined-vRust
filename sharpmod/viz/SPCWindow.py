@@ -81,7 +81,7 @@ from sharppy.viz.SPCWindow import SPCWindow as _VendoredSPCWindow  # noqa: E402
 # package (tasks 14-16, plus the hazard label added in 17.3).
 from sharpmod import colors  # noqa: E402
 from sharpmod.viz.custom_panel import CustomPanel, PanelItem  # noqa: E402
-from sharpmod.viz.skew import draw_hgz_overlay  # noqa: E402
+from sharpmod.viz.skew import draw_hgz_overlay, draw_cape_fill  # noqa: E402
 
 __all__ = [
     "RenderController",
@@ -89,6 +89,7 @@ __all__ = [
     "compose_window",
     "MountResult",
     "attach_hgz_overlay",
+    "attach_cape_fill",
     "attach_family_rows",
     "mount_products",
     "reapply_color_scheme",
@@ -313,6 +314,11 @@ def _fmt_f1(raw):
     return f"{_scalar(raw):.1f}"
 
 
+def _fmt_f2(raw):
+    """Two decimal places (NCAPE and other fine-grained readouts)."""
+    return f"{_scalar(raw):.2f}"
+
+
 def _fmt_mag_int(raw):
     """Magnitude of a 2-vector as a rounded integer (mean-wind speed)."""
     return str(int(round(_scalar(raw))))
@@ -357,7 +363,7 @@ KINEMATIC_FAMILY_ROWS = [
 THERMO_FAMILY_ROWS = [
     ("6CAPE", "cape_0_6km", _fmt_int, "cape"),
     ("HGZ CAPE", "hgz_cape", _fmt_int, "cape"),
-    ("NCAPE", "ncape", _fmt_f1, None),
+    ("NCAPE", "ncape", _fmt_f2, None),
     ("WBZ Height", "wbz_height", _fmt_int, None),
     ("ECAPE", "ecape", _fmt_int, "cape"),
     ("SFC-1km LR", "lapserate_sfc_1km", _fmt_f1, "lapse_rate"),
@@ -538,7 +544,7 @@ def _derived_profile(prof):
         return prof
 
 
-def attach_hgz_overlay(skewt, *, fill_color=None, edge_color=None):
+def attach_hgz_overlay(skewt, *, fill_color=None, edge_color=None, draw_fill=True):
     """Install the Hail-Growth-Zone overlay pass on a vendored skew-T widget.
 
     This is the concrete mount seam for Requirements 19.9-19.11: it wraps the
@@ -605,6 +611,7 @@ def attach_hgz_overlay(skewt, *, fill_color=None, edge_color=None):
                     draw_hgz_overlay(
                         qp, prof, rect, _transform,
                         fill_color=fill_color, edge_color=edge_color,
+                        draw_fill=draw_fill,
                     )
                 finally:
                     qp.end()
@@ -615,6 +622,88 @@ def attach_hgz_overlay(skewt, *, fill_color=None, edge_color=None):
 
     skewt.plotData = _wrapped_plot_data
     skewt._sharpmod_hgz_attached = True
+    return True
+
+
+def attach_cape_fill(skewt, *, pos_color=None, neg_color=None):
+    """Install the CAPE/CIN buoyancy-area fill pass on a vendored skew-T widget.
+
+    Wraps the skew-T's ``plotData`` so that, *after* the vendored widget renders
+    its temperature/dewpoint/parcel traces onto its backing pixmap, the area
+    between the current parcel's virtual-temperature trace (``skewt.pcl.ttrace``
+    / ``ptrace``) and the environment virtual-temperature trace
+    (``skewt.prof.vtmp`` / ``pres``) is shaded via
+    :func:`sharpmod.viz.skew.draw_cape_fill`: orange where the parcel is warmer
+    (CAPE) and blue where it is colder (CIN).
+
+    The pass uses the widget's own composed transforms -- ``originy +
+    pres_to_pix(p)/scale`` and ``originx + tmpc_to_pix(t, p)/scale`` -- so the
+    shading aligns with the plotted parcel trace under pan/zoom, and is clipped
+    to the plot rectangle (``tlx/tly/brx/bry``). It draws nothing when no parcel
+    has been set. The wrapper swallows any error so it can never break the base
+    skew-T rendering. Returns ``True`` when the pass was installed, ``False``
+    when the widget does not expose the required hooks.
+    """
+    if skewt is None:
+        return False
+    if getattr(skewt, "_sharpmod_cape_fill_attached", False):
+        return True
+    original_plot_data = getattr(skewt, "plotData", None)
+    if not callable(original_plot_data):
+        return False
+
+    def _plot_rect():
+        tlx = getattr(skewt, "tlx", None)
+        tly = getattr(skewt, "tly", None)
+        brx = getattr(skewt, "brx", None)
+        bry = getattr(skewt, "bry", None)
+        if None in (tlx, tly, brx, bry):
+            return None
+        return QRect(int(tlx), int(tly), int(brx - tlx), int(bry - tly))
+
+    def _to_y(p):
+        originy = getattr(skewt, "originy", 0.0) or 0.0
+        scale = getattr(skewt, "scale", 1.0) or 1.0
+        return originy + skewt.pres_to_pix(p) / scale
+
+    def _to_x(t, p):
+        originx = getattr(skewt, "originx", 0.0) or 0.0
+        scale = getattr(skewt, "scale", 1.0) or 1.0
+        return originx + skewt.tmpc_to_pix(t, p) / scale
+
+    def _wrapped_plot_data(*args, **kwargs):
+        result = original_plot_data(*args, **kwargs)
+        try:
+            prof = getattr(skewt, "prof", None)
+            pcl = getattr(skewt, "pcl", None)
+            rect = _plot_rect()
+            bitmap = getattr(skewt, "plotBitMap", None)
+            if prof is not None and pcl is not None and rect is not None and bitmap is not None:
+                qp = QtGui.QPainter()
+                qp.begin(bitmap)
+                try:
+                    qp.setRenderHint(qp.Antialiasing)
+                    draw_cape_fill(
+                        qp,
+                        getattr(pcl, "ttrace", None),
+                        getattr(pcl, "ptrace", None),
+                        getattr(prof, "pres", None),
+                        getattr(prof, "vtmp", None),
+                        rect,
+                        _to_x,
+                        _to_y,
+                        pos_color=pos_color,
+                        neg_color=neg_color,
+                    )
+                finally:
+                    qp.end()
+        except Exception:
+            # The fill pass must never break the base skew-T rendering.
+            pass
+        return result
+
+    skewt.plotData = _wrapped_plot_data
+    skewt._sharpmod_cape_fill_attached = True
     return True
 
 
@@ -906,10 +995,24 @@ def mount_products(win, prof=None, *, custom_config=None, custom_sars_lines=None
     except Exception as exc:  # noqa: BLE001 - record, never abort the mount
         result.blocked.append(f"IndexBoard: {exc}")
 
-    # 3. HGZ overlay -> skew-T (Requirement 19.9).
+    # 3. CAPE/CIN buoyancy fill + HGZ overlay -> skew-T (Requirement 19.9).
+    #    The CAPE/CIN fill is attached first so it renders *behind* the HGZ
+    #    boundary lines/label. The HGZ band's own translucent fill is suppressed
+    #    (``draw_fill=False``) so it does not muddy the buoyancy shading over the
+    #    -10/-30 C layer -- only its dashed boundaries + label remain.
+    skewt = getattr(sw, "sound", None)
     try:
-        skewt = getattr(sw, "sound", None)
-        if attach_hgz_overlay(skewt):
+        if attach_cape_fill(skewt):
+            result.mounted.append("CAPE/CIN buoyancy fill (skew-T)")
+        else:
+            result.blocked.append(
+                "CAPE/CIN fill: skew-T widget did not expose plotData/geometry"
+            )
+    except Exception as exc:  # noqa: BLE001
+        result.blocked.append(f"CAPE/CIN fill: {exc}")
+
+    try:
+        if attach_hgz_overlay(skewt, draw_fill=False):
             result.hgz_attached = True
             result.mounted.append("HGZ overlay (skew-T)")
         else:
