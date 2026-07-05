@@ -38,9 +38,9 @@ documented reference oracle over a documented set of >= 10 soundings:
   - **MCS index** is recovered by inverting upstream SHARPpy's ``params.mmp``
     maintenance *probability* (``MMP = 1/(1+exp(MCS_index))``), a fully
     independent route to the same quantity.
-  - **NCAPE/NCIN**, **HGZ CAPE**, **6CAPE**, **HPI**, and the **Peskov index**
-    are recomputed from their documented formulas using upstream SHARPpy parcel /
-    interpolation primitives.
+  - **NCAPE/NCIN**, **VGP**, **WBZ Height**, **HGZ CAPE**, **6CAPE**, **HPI**,
+    and the **Peskov index** are recomputed from their documented formulas using
+    upstream SHARPpy parcel / interpolation primitives.
 
 The whole SHARPpy-based suite is gated with ``pytest.importorskip("sharppy")``.
 
@@ -341,6 +341,35 @@ def _ref_ehi_0_3km(snd, sp):
     return _ref_ehi(snd, sp, 3000)
 
 
+def _ref_vgp(snd, sp):
+    from sharppy.sharptab import params as sp_params
+    from sharppy.sharptab import interp as sp_interp
+    from sharppy.sharptab import winds as sp_winds
+    from sharppy.sharptab import utils as sp_utils
+    sbcape = _finite(getattr(sp_params.parcelx(sp, flag=1), "bplus", None))
+    if sbcape is None or sbcape < 0.0:
+        return None
+    pbot = float(sp.pres[sp.sfc])
+    ptop = _finite(sp_interp.pres(sp, sp_interp.to_msl(sp, 4000.0)))
+    if ptop is None:
+        return None
+    du, dv = sp_winds.wind_shear(sp, pbot=pbot, ptop=ptop)
+    shear_kt = _finite(sp_utils.mag(du, dv))
+    if shear_kt is None:
+        return None
+    return math.sqrt(sbcape) * (float(sp_utils.KTS2MS(shear_kt)) / 4000.0)
+
+
+def _ref_wbz_height(snd, sp):
+    from sharppy.sharptab import params as sp_params
+    from sharppy.sharptab import interp as sp_interp
+    try:
+        wbz_pres = sp_params.temp_lvl(sp, 0, wetbulb=True)
+        return _finite(sp_interp.to_agl(sp, sp_interp.hght(sp, wbz_pres)))
+    except Exception:
+        return None
+
+
 def _ref_lrghail(snd, sp):
     from sharppy.sharptab import params as sp_params
     return _finite(sp_params.lhp(sp))
@@ -533,6 +562,8 @@ _ORACLES = {
     "lapserate_sfc_1km": (_val_lapserate_sfc_1km, _ref_lapserate_sfc_1km),
     "ehi_0_1km": (_val_ehi_0_1km, _ref_ehi_0_1km),
     "ehi_0_3km": (_val_ehi_0_3km, _ref_ehi_0_3km),
+    "vgp": (derived_mod.vorticity_generation_parameter, _ref_vgp),
+    "wbz_height": (derived_mod.wet_bulb_zero_height, _ref_wbz_height),
     "lrghail": (derived_mod.large_hail_parameter, _ref_lrghail),
     "mcs_index": (derived_mod.mcs_index, _ref_mcs_index),
     "ncape": (_val_ncape, _ref_ncape),

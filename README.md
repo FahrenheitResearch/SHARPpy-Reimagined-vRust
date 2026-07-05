@@ -87,6 +87,8 @@ The sounding window's **Export** menu saves the current view:
 - **Export Image (PNG)** (`Ctrl+E`) — the full window, including the mounted
   derived-parameter panels, with a sensible default filename
   (`STATION_YYYYMMDDHHZ.png`) in your Desktop folder.
+- **Copy Image to Clipboard** (`Ctrl+Shift+C`) — the same current view, ready
+  to paste into another app.
 - **Export Text (SPC tabular)** — the focused profile as a text file that loads
   back into the app.
 

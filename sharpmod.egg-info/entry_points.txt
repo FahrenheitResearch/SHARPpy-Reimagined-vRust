@@ -1,0 +1,5 @@
+[console_scripts]
+era5-extract = sharpmod.tools.era5_extract:main
+sharpmod-render = sharpmod.render:main
+uwyo-sounding = sharpmod.tools.uwyo_sounding:main
+wrf-extract = sharpmod.tools.wrf_extract:main

@@ -15,8 +15,8 @@ Values are *read* off two profiles and never recomputed here:
   parameters (parcel CAPE/CIN, PW, K, lapse rates, SRH, shear, STP/SCP/SHIP,
   ...); and
 * the **SHARPpy Reimagined derived Profile** (``derived_prof``) for the new lazy-derived
-  parameters (6CAPE, HGZ CAPE, ECAPE, NCAPE, NCIN, SFC-1km LR, SFC-500m
-  kinematics, DCP, EHI, HPI, LRGHAIL, Peskov, MCS).
+  parameters (6CAPE, HGZ CAPE, ECAPE, NCAPE, WBZ Height, SFC-1km LR, SFC-500m
+  kinematics, DCP, EHI, VGP, LRGHAIL, Peskov, MCS).
 
 Missing / masked / unavailable values render the documented ``--`` indicator.
 """
@@ -171,7 +171,7 @@ class ParamBoard(QFrame):
             E("DCAPE", _scalar(self._sp("dcape")), _fmt0, None),
             E("MUCIN", _scalar(self._parcel("mupcl", "bminus")), _fmt0, "cinh"),
             E("NCAPE", _scalar(self._dp("ncape")), _fmt1, None),
-            E("NCIN", _scalar(self._dp("ncin")), _fmt1, None),
+            E("WBZ Height", _scalar(self._dp("wbz_height")), _fmt0, None),
         ]))
 
         # Moisture / Lapse rates ----------------------------------------
@@ -213,7 +213,7 @@ class ParamBoard(QFrame):
 
         # Hail -----------------------------------------------------------
         groups.append(("Hail", [
-            E("HPI", _scalar(self._dp("hpi")), _fmt1, None),
+            E("VGP", _scalar(self._dp("vgp")), _fmt1, None),
             E("LRG HAIL", _scalar(self._dp("lrghail")), _fmt1, None),
         ]))
 

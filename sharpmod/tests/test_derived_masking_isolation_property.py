@@ -74,6 +74,8 @@ def _probe_all(prof) -> dict:
         "ncin": ncin,
         "ehi_0_1km": derived_mod.ehi(prof, 1000),
         "ehi_0_3km": derived_mod.ehi(prof, 3000),
+        "vgp": derived_mod.vorticity_generation_parameter(prof),
+        "wbz_height": derived_mod.wet_bulb_zero_height(prof),
         "lrghail": derived_mod.large_hail_parameter(prof),
         "hpi": derived_mod.hail_possibility_index(prof),
         "peskov": derived_mod.peskov_index(prof),

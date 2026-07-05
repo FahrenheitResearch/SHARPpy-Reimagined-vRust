@@ -275,10 +275,10 @@ def reapply_color_scheme(win, config=None):
 #     ``mean_wind_sfc_500m``) -> the vendored ``plotKinematics`` panel
 #     (``spc_widget.kinematic``), appended beneath the 0-1/0-3 km SRH/shear/
 #     mean-wind rows.
-#   * Layer thermodynamics (``cape_0_6km``, ``hgz_cape``, ``ncape``, ``ncin``,
+#   * Layer thermodynamics (``cape_0_6km``, ``hgz_cape``, ``ncape``, ``wbz_height``,
 #     ``ecape``, ``lapserate_sfc_1km``) -> the vendored ``plotText`` panel
 #     (``spc_widget.convective``), appended beneath the CAPE/lapse-rate rows.
-#   * Composite indices (``dcp``, ``ehi_0_1km``, ``ehi_0_3km``, ``hpi``,
+#   * Composite indices (``dcp``, ``ehi_0_1km``, ``ehi_0_3km``, ``vgp``,
 #     ``lrghail``, ``peskov``, ``mcs_index``) -> the vendored ``plotSTP``
 #     ("STP STATS") inset, appended beneath the STP/SCP/SHIP composite indices.
 #
@@ -358,7 +358,7 @@ THERMO_FAMILY_ROWS = [
     ("6CAPE", "cape_0_6km", _fmt_int, "cape"),
     ("HGZ CAPE", "hgz_cape", _fmt_int, "cape"),
     ("NCAPE", "ncape", _fmt_f1, None),
-    ("NCIN", "ncin", _fmt_f1, None),
+    ("WBZ Height", "wbz_height", _fmt_int, None),
     ("ECAPE", "ecape", _fmt_int, "cape"),
     ("SFC-1km LR", "lapserate_sfc_1km", _fmt_f1, "lapse_rate"),
 ]
@@ -368,7 +368,7 @@ COMPOSITE_FAMILY_ROWS = [
     ("DCP", "dcp", _fmt_f1, None),
     ("EHI 0-1km", "ehi_0_1km", _fmt_f1, None),
     ("EHI 0-3km", "ehi_0_3km", _fmt_f1, None),
-    ("HPI", "hpi", _fmt_f1, None),
+    ("VGP", "vgp", _fmt_f1, None),
     ("LRG HAIL", "lrghail", _fmt_f1, None),
     ("Peskov", "peskov", _fmt_f1, None),
     ("MCS", "mcs_index", _fmt_f1, None),
@@ -400,7 +400,7 @@ KINEMATIC_PANEL_ITEMS = [
 
 #: Hail group (large-hail parameters on their own).
 HAIL_PANEL_ITEMS = [
-    PanelItem(param="hpi"),
+    PanelItem(param="vgp"),
     PanelItem(param="lrghail"),
 ]
 
@@ -410,7 +410,7 @@ THERMO_PANEL_ITEMS = [
     PanelItem(param="hgz_cape"),
     PanelItem(param="ecape"),
     PanelItem(param="ncape"),
-    PanelItem(param="ncin"),
+    PanelItem(param="wbz_height"),
     PanelItem(param="lapserate_sfc_1km"),
 ]
 
@@ -438,11 +438,11 @@ EXSARS_PANEL_ITEMS = [
     PanelItem(param="hgz_cape"),
     PanelItem(param="ecape"),
     PanelItem(param="ncape"),
-    PanelItem(param="ncin"),
+    PanelItem(param="wbz_height"),
     PanelItem(param="dcp"),
     PanelItem(param="ehi_0_1km"),
     PanelItem(param="ehi_0_3km"),
-    PanelItem(param="hpi"),
+    PanelItem(param="vgp"),
     PanelItem(param="lrghail"),
     PanelItem(param="peskov"),
     PanelItem(param="mcs_index"),

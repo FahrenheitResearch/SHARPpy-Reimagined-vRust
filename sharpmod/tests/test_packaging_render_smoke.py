@@ -105,6 +105,11 @@ def _decodes_as_png(path: str) -> bool:
             return fh.read(len(_PNG_MAGIC)) == _PNG_MAGIC
 
 
+def _qimage_rgba_bytes(image):
+    image = image.convertToFormat(image.Format.Format_RGBA8888)
+    return image.width(), image.height(), bytes(image.bits())
+
+
 # --------------------------------------------------------------------------- #
 # 15.1 -- fresh-install importability
 # --------------------------------------------------------------------------- #
@@ -170,6 +175,54 @@ def test_font_resolution_does_not_require_system_font_dir(monkeypatch):
     assert names
     path = Path(font_resolver.font_path(names[0]))
     assert path.is_file()
+
+
+def test_png_export_compression_preserves_legacy_pixels(tmp_path):
+    """Compressed PNG export keeps the legacy widget grab dimensions/pixels."""
+    from qtpy import QtCore, QtGui, QtWidgets
+
+    from sharpmod.render import grab_widget_pixmap, save_widget_png
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+
+    class PatternWidget(QtWidgets.QWidget):
+        def paintEvent(self, event):  # noqa: N802 - Qt override
+            painter = QtGui.QPainter(self)
+            painter.fillRect(self.rect(), QtGui.QColor("#050505"))
+            painter.fillRect(12, 10, 86, 58, QtGui.QColor("#00d2ff"))
+            painter.fillRect(92, 34, 104, 76, QtGui.QColor("#ffcc00"))
+            pen = QtGui.QPen(QtGui.QColor("#ff2d55"), 3)
+            painter.setPen(pen)
+            painter.drawLine(0, 0, self.width(), self.height())
+            painter.drawText(QtCore.QRect(16, 96, 210, 32),
+                             QtCore.Qt.AlignLeft, "SHARPpy PNG export")
+            painter.end()
+
+    widget = PatternWidget()
+    widget.resize(240, 150)
+    widget.show()
+    app.processEvents()
+
+    legacy = tmp_path / "legacy_q100.png"
+    compressed = tmp_path / "compressed.png"
+    pixmap = grab_widget_pixmap(widget)
+    assert pixmap.save(str(legacy), "PNG", 100)
+    assert save_widget_png(widget, str(compressed))
+
+    legacy_img = QtGui.QImage(str(legacy))
+    compressed_img = QtGui.QImage(str(compressed))
+
+    assert (compressed_img.width(), compressed_img.height()) == (
+        legacy_img.width(), legacy_img.height())
+    assert (compressed_img.width(), compressed_img.height()) == (
+        widget.width(), widget.height())
+    assert _qimage_rgba_bytes(compressed_img) == _qimage_rgba_bytes(legacy_img)
+    assert compressed.stat().st_size < legacy.stat().st_size
+
+    widget.close()
+    widget.deleteLater()
 
 
 # --------------------------------------------------------------------------- #

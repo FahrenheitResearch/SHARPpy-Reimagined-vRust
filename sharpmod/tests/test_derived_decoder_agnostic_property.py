@@ -45,8 +45,9 @@ The full public derived-parameter surface is covered:
 * thermodynamics -- SFC->1 km lapse rate, hail-growth-zone (-10/-30 degrees C)
   CAPE, 0-6 km-AGL CAPE (:mod:`sharpmod.sharptab.params`);
 * ECAPE (:func:`sharpmod.sharptab.ecape.ecape`);
-* the composite indices DCP, NCAPE/NCIN, EHI (0-1 km and 0-3 km), LRGHAIL, HPI,
-  the Peskov index, and the MCS index (:mod:`sharpmod.sharptab.derived`).
+* the composite indices DCP, NCAPE/NCIN, EHI (0-1 km and 0-3 km), VGP,
+  WBZ Height, LRGHAIL, HPI, the Peskov index, and the MCS index
+  (:mod:`sharpmod.sharptab.derived`).
 
 Every derived routine degrades to the ``MISSING`` sentinel rather than raising,
 so ``both missing`` counts as equal; otherwise the two paths must agree exactly.
@@ -157,6 +158,8 @@ DERIVED_PARAMS = {
     "storm_motion_lstu": lambda p: _storm_motion_component(p, 2),
     "storm_motion_lstv": lambda p: _storm_motion_component(p, 3),
     "lapserate_sfc_1km": lambda p: params_mod.lapse_rate(p, 0.0, 1000.0, agl=True),
+    "vgp": derived_mod.vorticity_generation_parameter,
+    "wbz_height": derived_mod.wet_bulb_zero_height,
     "hgz_cape": lambda p: params_mod.layer_cape_isotherm(p, -10, -30),
     "cape_0_6km": lambda p: params_mod.layer_cape_agl(p, 0.0, 6000.0),
     "ecape": ecape_mod.ecape,

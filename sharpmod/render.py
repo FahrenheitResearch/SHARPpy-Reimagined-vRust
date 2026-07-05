@@ -78,7 +78,22 @@ from sharpmod.resources import font_resolver  # noqa: E402
 from sharpmod.viz.SPCWindow import RenderController, compose_window  # noqa: E402
 
 __all__ = ["RenderError", "RenderController", "fetch_url", "build_config",
-           "decode", "render", "main", "install_font"]
+           "decode", "render", "main", "install_font", "grab_widget_pixmap",
+           "save_widget_png"]
+
+
+def _png_lossless_compression_quality() -> int:
+    """Return Qt's lossless PNG compression setting for exported images.
+
+    For PNG, Qt's ``quality`` argument controls compression effort, not pixel
+    dimensions or visual fidelity. ``0`` gives the smallest lossless PNG while
+    preserving the same decoded pixels as the legacy ``quality=100`` save.
+    """
+    try:
+        value = int(os.environ.get("SHARPMOD_PNG_QUALITY", "0"))
+    except ValueError:
+        value = 0
+    return max(0, min(100, value))
 
 
 # ===========================================================================
@@ -147,6 +162,13 @@ STP_BOTTOM_MARGIN = int(os.environ.get("STP_BOTTOM_MARGIN", "16"))
 # Scale applied to the Effective Layer STP widget font_ratio so its axis-tick
 # and EF x-axis labels render smaller (<1 shrinks them).
 STP_LABEL_SCALE = float(os.environ.get("STP_LABEL_SCALE", "0.72"))
+# Maximum point size for the conditional tornado / VROT probability insets.
+# Their vendored draw methods size text from widget height and place labels in
+# very narrow rects, so the custom font can clip the title/legend/x labels.
+COND_PROB_LABEL_MAX_PT = int(os.environ.get("COND_PROB_LABEL_MAX_PT", "10"))
+# Maximum point size for the winter/DGZ panel. The vendored widget scales text
+# by panel height and writes long strings into tiny rects with TextDontClip.
+WINTER_LABEL_MAX_PT = int(os.environ.get("WINTER_LABEL_MAX_PT", "11"))
 # Extra vertical space (px) added to the window/canvas so the SHARPpy Reimagined family
 # panels -- placed as a second row in the vendored bottom table band -- render
 # fully below the index tables without overlap (Step 4 -- in-grid placement).
@@ -579,8 +601,8 @@ def _install_skewt_sfc_label_mask():
                     th = fm.height()
                     pad_x = 1
                     pad_y = 1
-                    rect = _QtCore.QRectF(
-                        x[0] - tw / 2.0 - pad_x, y[0] + 4 - pad_y,
+                    rect = _skewt_surface_label_rect(
+                        self, _QtCore, x[0], y[0],
                         tw + 2 * pad_x, th + 2 * pad_y)
                     qp.setPen(_QtGui.QPen(self.bg_color, 0,
                                           _QtCore.Qt.SolidLine))
@@ -597,6 +619,106 @@ def _install_skewt_sfc_label_mask():
 
         _cls.drawTrace = drawTrace
         _cls._sharpmod_sfc_mask = True
+    except Exception:  # pragma: no cover - vendored module always present
+        pass
+
+
+def _install_skewt_effective_layer_label_fit():
+    """Keep effective-layer labels, including bottom ``SFC``, in the plot box."""
+    try:
+        import sharppy.viz.skew as _skew
+        _cls = _skew.plotSkewT
+        if getattr(_cls, "_sharpmod_effective_layer_fit", False):
+            return
+        _tab = _skew.tab
+        _QtGui = _skew.QtGui
+        _QtCore = _skew.QtCore
+        _orig = _cls.draw_effective_layer
+
+        def draw_effective_layer(self, qp):
+            try:
+                qp.setClipping(True)
+                ptop = self.prof.etop
+                pbot = self.prof.ebottom
+                line_len = 15
+                if not (_tab.utils.QC(ptop) and _tab.utils.QC(pbot)):
+                    return
+
+                x1 = self.tmpc_to_pix(-20, 1000)
+                x2 = self.tmpc_to_pix(-33, 1000)
+                y1 = self.originy + self.pres_to_pix(pbot) / self.scale
+                y2 = self.originy + self.pres_to_pix(ptop) / self.scale
+
+                sfc = _tab.interp.hght(
+                    self.prof, self.prof.pres[self.prof.sfc])
+                if self.prof.pres[self.prof.sfc] == pbot:
+                    text_bot = "SFC"
+                else:
+                    text_bot = _tab.interp.hght(self.prof, pbot) - sfc
+                    text_bot = _tab.utils.INT2STR(text_bot) + "m"
+                text_top = _tab.interp.hght(self.prof, ptop) - sfc
+                text_top = _tab.utils.INT2STR(text_top) + "m"
+
+                if self.use_left:
+                    esrh = self.prof.left_esrh[0]
+                else:
+                    esrh = self.prof.right_esrh[0]
+                text_esrh = _tab.utils.INT2STR(esrh) + " m2s2"
+
+                qp.setFont(self.esrh_font)
+                fm = _QtGui.QFontMetrics(self.esrh_font)
+                rect_h = max(float(getattr(self, "esrh_height", 0)),
+                             float(fm.height()) + 2.0)
+
+                def _label_rect(left, top, text, min_width):
+                    rect_w = max(float(min_width),
+                                 float(fm.horizontalAdvance(str(text))) + 4.0)
+                    return _fit_rect_to_skewt_plot(
+                        self, _QtCore,
+                        _QtCore.QRectF(float(left), float(top),
+                                       rect_w, rect_h))
+
+                def _surface_rect(left, line_y, text, min_width):
+                    rect_w = max(float(min_width),
+                                 float(fm.horizontalAdvance(str(text))) + 4.0)
+                    top = float(line_y) + 4.0
+                    bottom_limit = float(getattr(
+                        self, "bry", getattr(self, "hgt", line_y))) - 2.0
+                    if top + rect_h > bottom_limit:
+                        top = float(line_y) - 4.0 - rect_h
+                    return _fit_rect_to_skewt_plot(
+                        self, _QtCore,
+                        _QtCore.QRectF(float(left), top, rect_w, rect_h))
+
+                rect1 = _surface_rect(x2, y1, text_bot, 25.0)
+                rect2 = _label_rect(x2, y2 - rect_h, text_top, 50.0)
+                rect3 = _label_rect(x1 - 15.0, y2 - rect_h,
+                                    text_esrh, 50.0)
+
+                qp.setPen(_QtGui.QPen(self.bg_color, 0,
+                                      _QtCore.Qt.SolidLine))
+                qp.setBrush(_QtGui.QBrush(self.bg_color,
+                                          _QtCore.Qt.SolidPattern))
+                qp.drawRect(rect1)
+                qp.drawRect(rect2)
+                qp.drawRect(rect3)
+
+                qp.setPen(_QtGui.QPen(self.eff_layer_color, 2,
+                                      _QtCore.Qt.SolidLine))
+                qp.drawLine(x1 - line_len, y1, x1 + line_len, y1)
+                qp.drawLine(x1 - line_len, y2, x1 + line_len, y2)
+                qp.drawLine(x1, y1, x1, y2)
+                qp.drawText(rect1, _QtCore.Qt.AlignLeft |
+                            _QtCore.Qt.AlignVCenter, text_bot)
+                qp.drawText(rect2, _QtCore.Qt.AlignLeft |
+                            _QtCore.Qt.AlignVCenter, text_top)
+                qp.drawText(rect3, _QtCore.Qt.AlignLeft |
+                            _QtCore.Qt.AlignVCenter, text_esrh)
+            except Exception:
+                _orig(self, qp)
+
+        _cls.draw_effective_layer = draw_effective_layer
+        _cls._sharpmod_effective_layer_fit = True
     except Exception:  # pragma: no cover - vendored module always present
         pass
 
@@ -836,9 +958,8 @@ def enlarge_charts(spc_widget):
 SPEED_TITLE_MAX_PT = int(os.environ.get("SPEED_TITLE_MAX_PT", "9"))
 # Maximum point size for the wind-speed strip's numeric axis labels ("40 80
 # 120"). They are drawn into a short fixed-height slot at the strip's bottom,
-# so the taller bundled font spills past the widget edge and gets clipped;
-# capping keeps them inside the slot.
-SPEED_LABEL_MAX_PT = int(os.environ.get("SPEED_LABEL_MAX_PT", "12"))
+# so the taller bundled font spills past the widget edge and gets clipped.
+SPEED_LABEL_MAX_PT = int(os.environ.get("SPEED_LABEL_MAX_PT", "9"))
 # Maximum point size for the "Inf. Temp. Adv. (C/hr)" strip. The vendored
 # ``backgroundAdvection.initUI`` sizes its ``label_font`` (used for BOTH the
 # title and the strip's numeric axis labels) as ``width * font_ratio + 3``
@@ -853,6 +974,120 @@ SFC_LABEL_MAX_PT = int(os.environ.get("SFC_LABEL_MAX_PT", "10"))
 
 _speed_title_cap_installed = False
 _adv_font_cap_installed = False
+
+
+def _fit_rect_to_skewt_plot(widget, qtcore, rect, pad=2):
+    """Return ``rect`` shifted/shrunk so it stays inside the skew-T plot box."""
+    left_limit = float(getattr(widget, "lpad", 0)) + pad
+    right_limit = float(getattr(
+        widget, "brx", getattr(widget, "wid", left_limit))) - pad
+    top_limit = float(getattr(widget, "tpad", 0)) + pad
+    bottom_limit = float(getattr(
+        widget, "bry", getattr(widget, "hgt", top_limit))) - pad
+
+    if right_limit <= left_limit or bottom_limit <= top_limit:
+        return rect
+
+    width = min(float(rect.width()), max(1.0, right_limit - left_limit))
+    height = min(float(rect.height()), max(1.0, bottom_limit - top_limit))
+    max_left = right_limit - width
+    max_top = bottom_limit - height
+    left = min(max(float(rect.x()), left_limit), max_left)
+    top = min(max(float(rect.y()), top_limit), max_top)
+    return qtcore.QRectF(left, top, width, height)
+
+
+def _skewt_surface_label_rect(widget, qtcore, center_x, line_y, width, height,
+                              below_offset=4, pad=2):
+    """Place a near-surface label below its line, or above it if needed."""
+    bottom_limit = float(getattr(
+        widget, "bry", getattr(widget, "hgt", line_y))) - pad
+    left = float(center_x) - float(width) / 2.0
+    top = float(line_y) + below_offset
+    if top + float(height) > bottom_limit:
+        top = float(line_y) - below_offset - float(height)
+    rect = qtcore.QRectF(left, top, float(width), float(height))
+    return _fit_rect_to_skewt_plot(widget, qtcore, rect, pad=pad)
+
+
+def _speed_axis_label_font(base_font, qtgui, text, max_width, max_height,
+                           max_pt=SPEED_LABEL_MAX_PT, min_pt=6):
+    """Return a copy of ``base_font`` small enough for a speed-axis tick."""
+    font = qtgui.QFont(base_font)
+    pt = font.pointSize()
+    if pt < 0:
+        pt = font.pixelSize()
+    if pt <= 0:
+        pt = max_pt
+    pt = min(int(pt), int(max_pt))
+
+    while pt > int(min_pt):
+        font.setPointSize(pt)
+        metrics = qtgui.QFontMetrics(font)
+        if (metrics.height() <= max_height and
+                metrics.horizontalAdvance(str(text)) <= max_width):
+            return font
+        pt -= 1
+
+    font.setPointSize(max(int(min_pt), 1))
+    return font
+
+
+def _font_metrics_advance(metrics, text):
+    advance = getattr(metrics, "horizontalAdvance", None)
+    if advance is None:
+        advance = metrics.width
+    return advance(str(text))
+
+
+def _fit_font_to_rect(qtgui, base_font, text, max_width, max_height,
+                      *, max_pt=COND_PROB_LABEL_MAX_PT, min_pt=6):
+    """Return a copy of ``base_font`` small enough for ``text`` to fit."""
+    font = qtgui.QFont(base_font)
+    pt = font.pointSizeF()
+    if pt <= 0:
+        px = font.pixelSize()
+        pt = float(px) if px > 0 else float(max_pt)
+    pt = min(float(pt), float(max_pt))
+
+    while pt > float(min_pt):
+        font.setPointSizeF(pt)
+        metrics = qtgui.QFontMetrics(font)
+        if (metrics.height() <= max_height and
+                _font_metrics_advance(metrics, text) <= max_width):
+            return font
+        pt -= 0.5
+
+    font.setPointSizeF(max(float(min_pt), 1.0))
+    return font
+
+
+def _centered_rect_in_bounds(qtcore, center_x, top, width, height,
+                             left_limit, right_limit):
+    width = min(float(width), max(1.0, float(right_limit) - float(left_limit)))
+    left = float(center_x) - width / 2.0
+    max_left = float(right_limit) - width
+    left = min(max(left, float(left_limit)), max_left)
+    return qtcore.QRectF(left, float(top), width, float(height))
+
+
+def _draw_fitted_text(qp, qtcore, qtgui, rect, text, font, color,
+                      flags=None, *, max_pt=COND_PROB_LABEL_MAX_PT,
+                      min_pt=6, elide=False):
+    """Draw text inside rect after fitting the font and optionally eliding."""
+    if flags is None:
+        flags = qtcore.Qt.AlignCenter
+    fitted = _fit_font_to_rect(
+        qtgui, font, text, max(1.0, rect.width() - 2),
+        max(1.0, rect.height() - 1), max_pt=max_pt, min_pt=min_pt)
+    qp.setFont(fitted)
+    qp.setPen(qtgui.QPen(color, 1, qtcore.Qt.SolidLine))
+    draw_text = str(text)
+    if elide:
+        metrics = qtgui.QFontMetrics(fitted)
+        draw_text = metrics.elidedText(
+            draw_text, qtcore.Qt.ElideRight, max(1, int(rect.width()) - 2))
+    qp.drawText(rect, flags, draw_text)
 
 
 def _install_advection_font_cap():
@@ -963,11 +1198,9 @@ def _install_speed_title_cap():
         _cls.initUI = initUI
 
         # The vendored ``draw_speed`` draws the "40 80 120" axis labels into a
-        # fixed 10 px-tall rect at ``bry+5``; the ~12 pt font (kept consistent
-        # with the skew-T isotherm labels) spills past the widget's bottom edge
-        # and is clipped. Redraw them in the full bottom-pad slot (``bry+2`` ..
-        # widget bottom) so the larger, consistent font fits. Each label already
-        # owns a wide 40-kt slot, so there is no horizontal crowding.
+        # fixed 10 px-tall rect at ``bry+5``; larger fonts spill past the widget
+        # bottom and the 120-kt label can exceed its horizontal slot. Fit the
+        # local tick font to the actual slot before drawing.
         _Qt = _speed_mod.QtCore.Qt
         _orig_draw = _cls.draw_speed
 
@@ -982,18 +1215,503 @@ def _install_speed_title_cap():
                                - self.speed_to_pix(s - delta))
                 qp.drawLine(int(x1), int(self.bry), int(x1), int(self.tly))
                 if drawlabel is True and s > 0:
+                    text = str(int(s))
+                    label_height = max(1, int(self.bpad) - 4)
+                    label_width = max(1, int(label_width))
+                    label_font = _speed_axis_label_font(
+                        self.label_font, _QtGui_s, text,
+                        max(1, label_width - 2), label_height)
+                    qp.setFont(label_font)
                     pen = _QtGui_s.QPen(_QtGui_s.QColor(self.fg_color), 1,
                                         _Qt.DashLine)
                     qp.setPen(pen)
-                    qp.drawText(int(labelx1), int(self.bry + 2),
-                                int(label_width), int(self.bpad - 2),
-                                _Qt.AlignTop | _Qt.AlignCenter, str(int(s)))
+                    qp.drawText(int(labelx1), int(self.bry + 1),
+                                label_width, label_height,
+                                _Qt.AlignVCenter | _Qt.AlignHCenter, text)
             except Exception:
                 _orig_draw(self, s, qp, delta=delta, drawlabel=drawlabel)
 
         _cls.draw_speed = draw_speed
         _cls._sharpmod_title_cap = True
         _speed_title_cap_installed = True
+    except Exception:  # pragma: no cover - vendored module always present
+        pass
+
+
+def _install_conditional_prob_panel_fit():
+    """Keep conditional STPC/VROT probability-panel text inside its frame.
+
+    The vendored ``stpef`` and ``vrot`` panels draw title, legend, y-tick, and
+    x-tick labels into very small fixed rectangles with ``TextDontClip``. On the
+    enlarged GUI/render canvas and bundled font, labels either crowd the plot
+    area or clip against panel edges. These replacements keep the same plotted
+    curves/data but fit every text label to its available slot.
+    """
+    try:
+        import numpy as _np
+        import sharppy.databases.inset_data as _ins
+        import sharppy.viz.stpef as _stpef_mod
+        import sharppy.viz.vrot as _vrot_mod
+
+        def _draw_header(qp, self, qtcore, qtgui, title, legend):
+            label_h = float(getattr(
+                self, "label_height", getattr(self, "box_height",
+                                              getattr(self, "plot_height", 12))))
+            title_rect = qtcore.QRectF(4, 2, max(1.0, self.brx - 8),
+                                       max(1.0, self.plot_height))
+            _draw_fitted_text(
+                qp, qtcore, qtgui, title_rect, title, self.plot_font,
+                self.fg_color, qtcore.Qt.AlignCenter,
+                max_pt=COND_PROB_LABEL_MAX_PT)
+
+            top = 3 + self.plot_height
+            height = max(1.0, label_h - 1)
+            for center_x, label, color, width in legend:
+                rect = _centered_rect_in_bounds(
+                    qtcore, center_x, top, width, height,
+                    max(1.0, self.tlx + 24), max(2.0, self.brx - 2))
+                _draw_fitted_text(
+                    qp, qtcore, qtgui, rect, label,
+                    qtgui.QFont("Helvetica", COND_PROB_LABEL_MAX_PT),
+                    qtgui.QColor(color), qtcore.Qt.AlignCenter,
+                    max_pt=COND_PROB_LABEL_MAX_PT)
+
+        def _draw_y_grid(qp, self, qtcore, qtgui, texts):
+            label_h = float(getattr(
+                self, "label_height", getattr(self, "box_height",
+                                              getattr(self, "plot_height", 12))))
+            base_font = qtgui.QFont("Helvetica", min(
+                COND_PROB_LABEL_MAX_PT, max(6, int(getattr(self, "fsize", 8)))))
+            for text in texts:
+                try:
+                    tick = self.prob_to_pix(int(text))
+                except Exception:
+                    continue
+                qp.setPen(qtgui.QPen(qtgui.QColor("#0080FF"), 1,
+                                      qtcore.Qt.DashLine))
+                qp.drawLine(self.tlx, tick, self.brx, tick)
+                rect = qtcore.QRectF(self.tlx, tick - label_h / 2.0,
+                                     24, max(1.0, label_h))
+                _draw_fitted_text(
+                    qp, qtcore, qtgui, rect, text, base_font, self.fg_color,
+                    qtcore.Qt.AlignCenter, max_pt=COND_PROB_LABEL_MAX_PT)
+
+        def _draw_x_label(qp, self, qtcore, qtgui, center_x, width, text):
+            rect = _centered_rect_in_bounds(
+                qtcore, center_x, self.bry + 1,
+                max(1.0, width), max(1.0, self.bpad - 2),
+                max(0.0, self.tlx), max(1.0, self.brx - 1))
+            _draw_fitted_text(
+                qp, qtcore, qtgui, rect, text,
+                qtgui.QFont("Helvetica", COND_PROB_LABEL_MAX_PT),
+                self.fg_color, qtcore.Qt.AlignCenter,
+                max_pt=COND_PROB_LABEL_MAX_PT, min_pt=5)
+
+        _stpef_cls = _stpef_mod.backgroundSTPEF
+        if not getattr(_stpef_cls, "_sharpmod_text_fit", False):
+            _stpef_orig = _stpef_cls.draw_frame
+            _QtGuiS = _stpef_mod.QtGui
+            _QtCoreS = _stpef_mod.QtCore
+
+            def stpef_draw_frame(self, qp):
+                try:
+                    data = _ins.condSTPData()
+                    colors = {
+                        "EF1+": "#006600",
+                        "EF2+": "#FFCC33",
+                        "EF3+": "#FF0000",
+                        "EF4+": "#FF00FF",
+                    }
+                    _draw_header(qp, self, _QtCoreS, _QtGuiS,
+                                 "Conditional Tornado Probs based on STPC",
+                                 [
+                                     (self.stpc_to_pix(.2), "EF1+",
+                                      colors["EF1+"], 48),
+                                     (self.stpc_to_pix(1.1), "EF2+",
+                                      colors["EF2+"], 48),
+                                     (self.stpc_to_pix(3.1), "EF3+",
+                                      colors["EF3+"], 48),
+                                     (self.stpc_to_pix(6.1), "EF4+",
+                                      colors["EF4+"], 48),
+                                 ])
+
+                    _draw_y_grid(qp, self, _QtCoreS, _QtGuiS, data["ytexts"])
+
+                    width = self.brx / 12.0
+                    spacing = self.brx / 12.0
+                    centers = _np.arange(spacing, self.brx, spacing)
+                    xtexts = data["xticks"]
+                    for i, text in enumerate(xtexts):
+                        if i >= len(centers):
+                            break
+                        _draw_x_label(qp, self, _QtCoreS, _QtGuiS,
+                                      centers[i], width, text)
+
+                    series = [
+                        ("EF1+", colors["EF1+"]),
+                        ("EF2+", colors["EF2+"]),
+                        ("EF3+", colors["EF3+"]),
+                        ("EF4+", colors["EF4+"]),
+                    ]
+                    for key, color in series:
+                        vals = data[key]
+                        qp.setPen(_QtGuiS.QPen(_QtGuiS.QColor(color), 3,
+                                               _QtCoreS.Qt.SolidLine))
+                        for i in range(1, _np.asarray(xtexts).shape[0], 1):
+                            qp.drawLine(
+                                centers[i - 1], self.prob_to_pix(vals[i - 1]),
+                                centers[i], self.prob_to_pix(vals[i]))
+                except Exception:
+                    _stpef_orig(self, qp)
+
+            _stpef_cls.draw_frame = stpef_draw_frame
+            _stpef_cls._sharpmod_text_fit = True
+
+        _vrot_cls = _vrot_mod.backgroundVROT
+        if not getattr(_vrot_cls, "_sharpmod_text_fit", False):
+            _vrot_orig = _vrot_cls.draw_frame
+            _QtGuiV = _vrot_mod.QtGui
+            _QtCoreV = _vrot_mod.QtCore
+
+            def vrot_draw_frame(self, qp):
+                try:
+                    data = self.vrot_inset_data
+                    _draw_header(qp, self, _QtCoreV, _QtGuiV,
+                                 "Conditional EF-scale Probs based on Vrot",
+                                 [
+                                     (self.vrot_to_pix(25), "EF0-EF1",
+                                      self.EF01_color, 74),
+                                     (self.vrot_to_pix(50), "EF2-EF3",
+                                      self.EF23_color, 74),
+                                     (self.vrot_to_pix(75), "EF4-EF5",
+                                      self.EF45_color, 74),
+                                 ])
+
+                    _draw_y_grid(qp, self, _QtCoreV, _QtGuiV, data["ytexts"])
+
+                    width = self.brx / 12.0
+                    for text in _np.arange(10, 110, 10):
+                        _draw_x_label(qp, self, _QtCoreV, _QtGuiV,
+                                      self.vrot_to_pix(text), width, str(text))
+
+                    xpts = data["xpts"]
+                    series = [
+                        ("EF0-EF1", self.EF01_color),
+                        ("EF2-EF3", self.EF23_color),
+                        ("EF4-EF5", self.EF45_color),
+                    ]
+                    for key, color in series:
+                        vals = data[key]
+                        lastprob = min(vals[0], 70)
+                        for i in range(1, _np.asarray(xpts).shape[0], 1):
+                            prob = min(vals[i], 70)
+                            style = (_QtCoreV.Qt.DotLine if vals[i] > 70
+                                     else _QtCoreV.Qt.SolidLine)
+                            qp.setPen(_QtGuiV.QPen(
+                                _QtGuiV.QColor(color), 2.5, style))
+                            qp.drawLine(
+                                self.vrot_to_pix(xpts[i - 1]),
+                                self.prob_to_pix(lastprob),
+                                self.vrot_to_pix(xpts[i]),
+                                self.prob_to_pix(prob))
+                            lastprob = prob
+                except Exception:
+                    _vrot_orig(self, qp)
+
+            _vrot_cls.draw_frame = vrot_draw_frame
+            _vrot_cls._sharpmod_text_fit = True
+    except Exception:  # pragma: no cover - vendored modules always present
+        pass
+
+
+def _install_winter_text_fit():
+    """Keep winter/DGZ panel text inside its columns.
+
+    The vendored winter panel uses a height-scaled font and then draws long
+    strings into one-tenth-width rectangles with ``TextDontClip``. The result is
+    column bleed and right-edge clipping. This caps the panel font and redraws
+    dynamic rows into actual full-width/column-width rects with elision only as
+    a last resort.
+    """
+    try:
+        import platform as _platform
+        import sharppy.sharptab as _tab
+        import sharppy.viz.winter as _winter_mod
+        _QtGui = _winter_mod.QtGui
+        _QtCore = _winter_mod.QtCore
+        _bg = _winter_mod.backgroundWinter
+        _plot = _winter_mod.plotWinter
+        if getattr(_plot, "_sharpmod_text_fit", False):
+            return
+
+        _orig_init = _bg.initUI
+
+        def initUI(self):
+            _orig_init(self)
+            try:
+                f = _QtGui.QFont(self.label_font)
+                ps = f.pointSizeF()
+                if ps <= 0:
+                    ps = float(f.pixelSize() if f.pixelSize() > 0
+                               else WINTER_LABEL_MAX_PT)
+                if ps > WINTER_LABEL_MAX_PT:
+                    f.setPointSizeF(float(WINTER_LABEL_MAX_PT))
+                    self.label_font = f
+                    self.label_metrics = _QtGui.QFontMetrics(f)
+                    self.os_mod = (self.label_metrics.descent()
+                                   if _platform.system() == "Windows" else 0)
+                    self.label_height = self.label_metrics.xHeight() + self.tpad
+                    self.ylast = self.label_height
+                    self.plotBitMap.fill(self.bg_color)
+                    self.plotBackground()
+            except Exception:
+                pass
+
+        def _columns(self):
+            split = float(self.brx) * 0.48
+            left_x = int(self.lpad)
+            left_w = max(1, int(split - left_x - 6))
+            right_x = int(split + 8)
+            right_w = max(1, int(float(self.brx) - right_x - self.rpad - 4))
+            return left_x, left_w, right_x, right_w
+
+        def _row_height(self):
+            metrics = _QtGui.QFontMetrics(self.label_font)
+            return max(int(metrics.height()), int(self.label_height) + 4)
+
+        def _row_gap(self):
+            return 2
+
+        def _section_gap(self):
+            return 4
+
+        def _dgz_divider_gap(self):
+            return 8
+
+        def _row_step(self):
+            return _row_height(self) + _row_gap(self)
+
+        def _precip_font(self):
+            big = _QtGui.QFont(self.label_font)
+            big.setBold(True)
+            big.setPointSizeF(min(WINTER_LABEL_MAX_PT + 3,
+                                  max(big.pointSizeF(), WINTER_LABEL_MAX_PT)))
+            return big
+
+        def _precip_row_height(self):
+            metrics = _QtGui.QFontMetrics(_precip_font(self))
+            return max(_row_height(self), int(metrics.height()) + 2)
+
+        def _draw_text(self, qp, rect, text, color=None, align=None,
+                       base_font=None, max_pt=None, min_pt=4):
+            if align is None:
+                align = _QtCore.Qt.AlignLeft | _QtCore.Qt.AlignVCenter
+            if color is None:
+                color = self.fg_color
+            if max_pt is None:
+                max_pt = WINTER_LABEL_MAX_PT
+            fit_height = max(float(rect.height()), float(_row_height(self)))
+            font = _fit_font_to_rect(
+                _QtGui, base_font or self.label_font, str(text),
+                max(1, int(rect.width()) - 2),
+                max(1, int(fit_height)),
+                max_pt=max_pt, min_pt=min_pt)
+            qp.setFont(font)
+            qp.setPen(_QtGui.QPen(color, 1, _QtCore.Qt.SolidLine))
+            qp.drawText(rect, align | _QtCore.Qt.TextDontClip, str(text))
+
+        def draw_frame(self, qp):
+            qp.setPen(_QtGui.QPen(self.dgz_color, 1, _QtCore.Qt.SolidLine))
+            qp.setFont(self.label_font)
+
+            row_h = _row_height(self)
+            step = _row_step(self)
+            section_gap = _section_gap(self)
+
+            header_rect = _QtCore.QRectF(0, self.tpad, self.wid, row_h)
+            _draw_text(
+                self, qp, header_rect,
+                '*** DENDRITIC GROWTH ZONE (-12 TO -17 C) ***',
+                color=self.dgz_color,
+                align=_QtCore.Qt.AlignCenter,
+                min_pt=4)
+
+            self.oprh_y1 = self.tpad + step
+            self.layers_y1 = self.oprh_y1 + step + section_gap
+            begin = self.layers_y1 + step
+            y1 = (self.layers_y1 + 3 * step +
+                  _dgz_divider_gap(self) - _row_gap(self))
+
+            qp.setPen(_QtGui.QPen(self.fg_color, 1, _QtCore.Qt.SolidLine))
+            qp.drawLine(0, y1, self.brx, y1)
+            qp.drawLine(self.brx * .48, y1, self.brx * .48, begin)
+
+            self.init_phase_y1 = y1 + section_gap
+            y1 = self.init_phase_y1 + step + section_gap - _row_gap(self)
+            qp.drawLine(0, y1, self.brx, y1)
+
+            backup = y1 + section_gap
+            y1 = backup + 4 * step + section_gap - _row_gap(self)
+
+            self.energy_y1 = backup
+            qp.drawLine(0, y1, self.brx, y1)
+            qp.drawLine(self.brx * .48, y1, self.brx * .48, backup)
+            y1 += section_gap
+
+            best_guess_rect = _QtCore.QRectF(0, y1, self.wid, row_h)
+            _draw_text(
+                self, qp, best_guess_rect,
+                '*** BEST GUESS PRECIP TYPE ***',
+                align=_QtCore.Qt.AlignCenter,
+                min_pt=4)
+            self.precip_type_y1 = y1 + step + section_gap
+            self.ptype_tmpf_y1 = (
+                self.precip_type_y1 + _precip_row_height(self) + section_gap)
+
+        def drawDGZLayer(self, qp):
+            pen = _QtGui.QPen(self.fg_color, 1, _QtCore.Qt.SolidLine)
+            qp.setPen(pen)
+            qp.setFont(self.label_font)
+            y1 = self.layers_y1
+            sep = _row_gap(self)
+            lh = _row_height(self)
+            left_x, left_w, right_x, right_w = _columns(self)
+
+            depth = ('Layer Depth: ' + _tab.utils.INT2STR(self.dgz_depth) +
+                     " ft (" + _tab.utils.INT2STR(self.dgz_zbot) + '-' +
+                     _tab.utils.INT2STR(self.dgz_ztop) + ' ft msl)')
+            _draw_text(self, qp, _QtCore.QRectF(
+                left_x, y1, self.brx - left_x - self.rpad - 4, lh), depth)
+            y1 += lh + sep + self.os_mod
+
+            if self.dgz_meanomeg == 10 * self.prof.missing:
+                omeg = 'N/A'
+            else:
+                omeg = _tab.utils.FLOAT2STR(self.dgz_meanomeg, 1) + ' ub/s'
+
+            rows = [
+                ('Mean Layer RH: ' +
+                 _tab.utils.FLOAT2STR(self.dgz_meanrh, 0) + ' %',
+                 'Mean Layer MixRat: ' +
+                 _tab.utils.FLOAT2STR(self.dgz_meanq, 1) + ' g/kg'),
+                ('Mean Layer PW: ' +
+                 _tab.utils.FLOAT2STR(self.dgz_pw, 1) + ' in',
+                 'Mean Layer Omega: ' + omeg),
+            ]
+            for left, right in rows:
+                _draw_text(self, qp, _QtCore.QRectF(left_x, y1, left_w, lh), left)
+                _draw_text(self, qp, _QtCore.QRectF(right_x, y1, right_w, lh),
+                           right)
+                y1 += lh + sep + self.os_mod
+
+        def drawInitial(self, qp):
+            qp.setPen(_QtGui.QPen(self.fg_color, 1, _QtCore.Qt.SolidLine))
+            qp.setFont(self.label_font)
+            rect = _QtCore.QRectF(
+                self.lpad, self.init_phase_y1,
+                self.brx - self.lpad - self.rpad - 4, _row_height(self))
+            if self.plevel > 100:
+                hght = _tab.utils.M2FT(_tab.interp.hght(self.prof, self.plevel))
+                text = ("Inital Phase: " + self.init_st + ' from: ' +
+                        _tab.utils.INT2STR(self.plevel) + ' mb (' +
+                        _tab.utils.INT2STR(hght) + ' ft msl; ' +
+                        _tab.utils.FLOAT2STR(self.init_tmp, 1) + ' C)')
+            else:
+                text = "Initial Phase:  No Precipitation layers found."
+            _draw_text(self, qp, rect, text)
+
+        def drawWCLayer(self, qp):
+            sep = _row_gap(self)
+            lh = _row_height(self)
+            left_x, left_w, right_x, right_w = _columns(self)
+
+            if self.tpos > 0 and self.tneg < 0:
+                string = ('P/N: ' + str(round(self.tpos, 0)) + ' / ' +
+                          str(round(self.tneg, 0)) + ' J/kg')
+                left_labels = [
+                    'TEMPERATURE PROFILE',
+                    string,
+                    'Melt Lyr: ' + str(int(self.ttop)) + '-' +
+                    str(int(self.tbot)) + ' mb',
+                    'Frz Lyr: ' + str(int(self.tbot)) + '-' +
+                    str(int(self.prof.pres[self.prof.sfc])) + ' mb',
+                ]
+            else:
+                left_labels = [
+                    'TEMPERATURE PROFILE', '',
+                    'Warm/Cold layers not found.', ''
+                ]
+
+            if self.wpos > 0 and self.wneg < 0:
+                string = ('P/N: ' + str(round(self.wpos, 0)) + ' / ' +
+                          str(round(self.wneg, 0)) + ' J/kg')
+                right_labels = [
+                    'WETBULB PROFILE',
+                    string,
+                    'Melt Lyr: ' + str(int(self.wtop)) + '-' +
+                    str(int(self.wbot)) + ' mb',
+                    'Frz Lyr: ' + str(int(self.wbot)) + '-' +
+                    str(int(self.prof.pres[self.prof.sfc])) + ' mb',
+                ]
+            else:
+                right_labels = [
+                    'WETBULB PROFILE', '',
+                    'Warm/Cold layers not found.', ''
+                ]
+
+            for x, width, labels in ((left_x, left_w, left_labels),
+                                     (right_x, right_w, right_labels)):
+                y1 = self.energy_y1
+                for text in labels:
+                    _draw_text(self, qp, _QtCore.QRectF(x, y1, width, lh), text)
+                    y1 += lh + sep + self.os_mod
+
+        def drawOPRH(self, qp):
+            if (self.oprh < -.1 and _tab.utils.QC(self.oprh) and
+                    self.dgz_meanomeg != -99990.0):
+                color = _QtCore.Qt.red
+            else:
+                color = self.fg_color
+
+            if self.dgz_meanomeg == -99990.0:
+                text = 'OPRH (Omega*PW*RH): N/A'
+            else:
+                text = ('OPRH (Omega*PW*RH): ' +
+                        _tab.utils.FLOAT2STR(self.oprh, 2))
+            rect = _QtCore.QRectF(0, self.oprh_y1, self.wid,
+                                  _row_height(self))
+            _draw_text(self, qp, rect, text, color=color,
+                       align=_QtCore.Qt.AlignCenter)
+
+        def drawPrecipType(self, qp):
+            big = _precip_font(self)
+            metrics = _QtGui.QFontMetrics(big)
+            height = max(_precip_row_height(self), metrics.height() + 2)
+            rect = _QtCore.QRectF(0, self.precip_type_y1, self.wid, height)
+            _draw_text(self, qp, rect, self.precip_type,
+                       align=_QtCore.Qt.AlignCenter, base_font=big,
+                       max_pt=WINTER_LABEL_MAX_PT + 3, min_pt=5)
+
+        def drawPrecipTypeTemp(self, qp):
+            small = _QtGui.QFont(self.label_font)
+            small.setPointSizeF(max(6.0, min(
+                WINTER_LABEL_MAX_PT, small.pointSizeF())))
+            metrics = _QtGui.QFontMetrics(small)
+            height = max(_row_height(self), metrics.height() + 2)
+            rect = _QtCore.QRectF(0, self.ptype_tmpf_y1, self.wid, height)
+            _draw_text(self, qp, rect, self.ptype_tmpf_string,
+                       align=_QtCore.Qt.AlignCenter, base_font=small,
+                       min_pt=5)
+
+        _bg.initUI = initUI
+        _bg.draw_frame = draw_frame
+        _plot.drawDGZLayer = drawDGZLayer
+        _plot.drawInitial = drawInitial
+        _plot.drawWCLayer = drawWCLayer
+        _plot.drawOPRH = drawOPRH
+        _plot.drawPrecipType = drawPrecipType
+        _plot.drawPrecipTypeTemp = drawPrecipTypeTemp
+        _plot._sharpmod_text_fit = True
     except Exception:  # pragma: no cover - vendored module always present
         pass
 
@@ -1022,7 +1740,7 @@ def enlarge_canvas(win):
         pass
 
 
-def rebrand_version_label(win, text="SHARPpy Reimagined v0.1"):
+def rebrand_version_label(win, text="SHARPpy Reimagined v0.1a (20260705)"):
     """Rename the vendored top-right ``SHARPpy v...`` label to the fork's brand.
 
     Returns the label widget (or ``None``) so callers can align it. Guarded so a
@@ -1108,6 +1826,21 @@ class RenderError(RuntimeError):
         self.infile = infile
         self.cause = cause
         super().__init__(f"failed to render {infile!r}: {message}")
+
+
+def grab_widget_pixmap(widget):
+    """Grab the exact widget pixels used by GUI export and CLI rendering.
+
+    This intentionally mirrors upstream SHARPpy's ``SPCWidget.pixmapToFile``
+    source pixmap, so exports keep the original widget shape and dimensions.
+    """
+    return widget.grab()
+
+
+def save_widget_png(widget, outfile: str) -> bool:
+    """Save ``widget`` as a losslessly compressed PNG without resizing it."""
+    pixmap = grab_widget_pixmap(widget)
+    return bool(pixmap.save(outfile, "PNG", _png_lossless_compression_quality()))
 
 
 # ---------------------------------------------------------------------------
@@ -1420,6 +2153,434 @@ def _install_hodo_zoom():
         _bg.__init__ = __init__
         _plot.setPreferences = setPreferences
         _bg._sharpmod_zoom = True
+    except Exception:  # pragma: no cover - vendored module always present
+        pass
+
+
+# Maximum point size for the hodograph label font (RM/LM storm motion labels).
+HODO_LABEL_MAX_PT = int(os.environ.get("HODO_LABEL_MAX_PT", "8"))
+# Maximum point size for the hodograph readout font (cursor wind readout).
+HODO_READOUT_MAX_PT = int(os.environ.get("HODO_READOUT_MAX_PT", "7"))
+
+
+def _fit_rect_to_hodo(widget, qtcore, rect, pad=2):
+    """Return ``rect`` shifted/shrunk so it stays inside the hodograph frame."""
+    left_limit = float(getattr(widget, "tlx", 0)) + pad
+    right_limit = float(getattr(
+        widget, "brx", getattr(widget, "wid", left_limit))) - pad
+    top_limit = float(getattr(widget, "tly", 0)) + pad
+    bottom_limit = float(getattr(
+        widget, "bry", getattr(widget, "hgt", top_limit))) - pad
+
+    if right_limit <= left_limit or bottom_limit <= top_limit:
+        return rect
+
+    width = min(float(rect.width()), max(1.0, right_limit - left_limit))
+    height = min(float(rect.height()), max(1.0, bottom_limit - top_limit))
+    max_left = right_limit - width
+    max_top = bottom_limit - height
+    left = min(max(float(rect.x()), left_limit), max_left)
+    top = min(max(float(rect.y()), top_limit), max_top)
+    return qtcore.QRectF(left, top, width, height)
+
+
+def _install_hodo_label_fit():
+    """Cap hodograph fonts and scale RM/LM + readout rects to the text.
+
+    The vendored ``backgroundHodo.initUI`` sizes ``label_font`` and
+    ``readout_font`` with a height-proportional term (``self.hgt * 0.0045``)
+    that grows too large on bigger displays. Meanwhile the ``drawSMV`` and
+    ``paintEvent`` readout rects are a fixed 55x12 / 55x16 px regardless of
+    actual font size, so the text clips or overflows.
+
+    This patch:
+    1. Caps ``label_font`` to :data:`HODO_LABEL_MAX_PT` and ``readout_font``
+       to :data:`HODO_READOUT_MAX_PT` after ``initUI`` runs.
+    2. Overrides ring labels so three-digit rings (``100``) use font-metrics
+       width and clamp inside the hodograph frame.
+    3. Overrides ``drawSMV`` to size the RM/LM label rects from font metrics.
+    4. Overrides ``paintEvent`` readout to size the cursor rect from metrics.
+
+    Idempotent + fully guarded.
+    """
+    try:
+        import sharppy.viz.hodo as _hodo_mod
+        import sharppy.sharptab as _tab
+        import numpy as _np
+
+        _bg = _hodo_mod.backgroundHodo
+        _plot = _hodo_mod.plotHodo
+        if getattr(_plot, "_sharpmod_label_fit", False):
+            return
+        _QtGui = _hodo_mod.QtGui
+        _QtCore = _hodo_mod.QtCore
+        try:
+            from qtpy.QtCore import QPointF as _QPointF
+            from qtpy.QtCore import QPoint as _QPoint
+        except Exception:
+            _QPointF = _QtCore.QPointF
+            _QPoint = _QtCore.QPoint
+
+        label_cap = int(HODO_LABEL_MAX_PT)
+        readout_cap = int(HODO_READOUT_MAX_PT)
+
+        # --- 1. Cap fonts after initUI (called at construction AND on resize) ---
+        _orig_initUI = _bg.initUI
+
+        def initUI(self):
+            _orig_initUI(self)
+            try:
+                if label_cap > 0:
+                    pt = self.label_font.pointSize()
+                    if pt < 0:
+                        pt = self.label_font.pixelSize()
+                    if pt > label_cap:
+                        self.label_font = _QtGui.QFont(
+                            self.label_font.family(), label_cap)
+                        self.label_font.setBold(True)
+                        self.label_metrics = _QtGui.QFontMetrics(self.label_font)
+                        self.label_height = (self.label_metrics.xHeight() + 5)
+                if readout_cap > 0:
+                    pt = self.readout_font.pointSize()
+                    if pt < 0:
+                        pt = self.readout_font.pixelSize()
+                    if pt > readout_cap:
+                        self.readout_font = _QtGui.QFont(
+                            self.readout_font.family(), readout_cap)
+                        self.readout_font.setBold(True)
+            except Exception:
+                pass
+
+        _bg.initUI = initUI
+
+        # --- 2. Override ring labels to use font-metrics-sized rects ---
+        _orig_ring = _bg.draw_ring
+
+        def _clamped_ring_rect(self, left, top, width, height):
+            left_limit = float(getattr(self, "tlx", 0)) + 2.0
+            right_limit = float(getattr(self, "brx", self.wid)) - 2.0
+            top_limit = float(getattr(self, "tly", 0)) + 2.0
+            bottom_limit = float(getattr(self, "bry", self.hgt)) - 2.0
+
+            width = min(float(width), max(1.0, right_limit - left_limit))
+            height = min(float(height), max(1.0, bottom_limit - top_limit))
+
+            left = float(left)
+            top = float(top)
+            if left + width > right_limit:
+                left = right_limit - width
+            if left < left_limit:
+                left = left_limit
+            if top + height > bottom_limit:
+                top = bottom_limit - height
+            if top < top_limit:
+                top = top_limit
+            return _QtCore.QRectF(left, top, width, height)
+
+        def draw_ring(self, spd, qp):
+            try:
+                color = self.isotach_color
+                _uu, vv = _tab.utils.vec2comp(0, spd)
+                radius = abs(float(vv) * float(self.scale))
+                center = _QtCore.QPointF(self.centerx, self.centery)
+
+                pen = _QtGui.QPen(_QtGui.QColor(color), 1)
+                pen.setStyle(_QtCore.Qt.DashLine)
+                qp.setPen(pen)
+                qp.drawEllipse(center, radius, radius)
+
+                text = _tab.utils.INT2STR(spd)
+                avail_w = max(1, int(float(self.brx) - float(self.tlx) - 4))
+                avail_h = max(1, int(float(self.bry) - float(self.tly) - 4))
+                font = _fit_font_to_rect(
+                    _QtGui, self.label_font, text, avail_w, 18,
+                    max_pt=label_cap, min_pt=5)
+                qp.setFont(font)
+                fm = _QtGui.QFontMetrics(font)
+                width = min(avail_w, max(15, fm.horizontalAdvance(text) + 6))
+                height = min(avail_h, max(15, fm.height() + 2))
+
+                offset = 5
+                rects = [
+                    ("top", _clamped_ring_rect(
+                        self, self.centerx + offset,
+                        self.centery - radius - offset, width, height)),
+                    ("right", _clamped_ring_rect(
+                        self, self.centerx + radius - offset,
+                        self.centery + offset, width, height)),
+                    ("bottom", _clamped_ring_rect(
+                        self, self.centerx + offset,
+                        self.centery + radius - offset, width, height)),
+                    ("left", _clamped_ring_rect(
+                        self, self.centerx - radius - offset,
+                        self.centery + offset, width, height)),
+                ]
+                suppressed_positions = set()
+                if int(spd) >= 80:
+                    suppressed_positions.add("top")
+                    suppressed_positions.add("bottom")
+                if int(spd) == 100:
+                    suppressed_positions.add("right")
+                if suppressed_positions:
+                    rects = [
+                        (pos, rect) for pos, rect in rects
+                        if pos not in suppressed_positions
+                    ]
+
+                for _pos, rect in rects:
+                    try:
+                        qp.fillRect(rect, self.bg_color)
+                    except Exception:
+                        pass
+                qp.setPen(_QtGui.QPen(self.fg_color))
+                for _pos, rect in rects:
+                    qp.drawText(rect, _QtCore.Qt.AlignCenter, text)
+            except Exception:
+                _orig_ring(self, spd, qp)
+
+        _bg.draw_ring = draw_ring
+
+        # --- 3. Override drawSMV to use font-metrics-sized rects ---
+        _orig_smv = _plot.drawSMV
+
+        def drawSMV(self, qp):
+            try:
+                # Duplicates vendored logic but with dynamic rect sizing.
+                penwidth = 1
+                pen = _QtGui.QPen(self.fg_color, penwidth)
+                pen.setStyle(_QtCore.Qt.SolidLine)
+                qp.setPen(pen)
+
+                rstu, rstv, lstu, lstv = self.srwind
+                bkru, bkrv, bklu, bklv = self.prof.bunkers
+                if not _tab.utils.QC(rstu) or not _tab.utils.QC(lstu):
+                    return
+
+                # Bunkers location markers (+)
+                ruu_b, rvv_b = self.uv_to_pix(bkru, bkrv)
+                luu_b, lvv_b = self.uv_to_pix(bklu, bklv)
+                center_rm_b = _QPointF(ruu_b, rvv_b)
+                center_lm_b = _QPointF(luu_b, lvv_b)
+                qp.drawLine(center_rm_b - _QPoint(2, 0),
+                            center_rm_b + _QPoint(2, 0))
+                qp.drawLine(center_rm_b - _QPoint(0, 2),
+                            center_rm_b + _QPoint(0, 2))
+                qp.drawLine(center_lm_b - _QPoint(2, 0),
+                            center_lm_b + _QPoint(2, 0))
+                qp.drawLine(center_lm_b - _QPoint(0, 2),
+                            center_lm_b + _QPoint(0, 2))
+
+                # User storm motion vectors (circles)
+                ruu, rvv = self.uv_to_pix(rstu, rstv)
+                luu, lvv = self.uv_to_pix(lstu, lstv)
+                center_rm = _QPointF(ruu, rvv)
+                center_lm = _QPointF(luu, lvv)
+                qp.drawEllipse(center_rm, 5, 5)
+                qp.drawEllipse(center_lm, 5, 5)
+
+                # Effective inflow layer lines
+                ptop, pbottom = self.ptop, self.pbottom
+                if _tab.utils.QC(ptop) and _tab.utils.QC(pbottom):
+                    utop, vtop = _tab.interp.components(self.prof, ptop)
+                    ubot, vbot = _tab.interp.components(self.prof, pbottom)
+                    uutop, vvtop = self.uv_to_pix(utop, vtop)
+                    uubot, vvbot = self.uv_to_pix(ubot, vbot)
+                    pen = _QtGui.QPen(self.eff_inflow_color, penwidth)
+                    pen.setStyle(_QtCore.Qt.SolidLine)
+                    qp.setPen(pen)
+                    if self.use_left:
+                        qp.drawLine(center_lm.x(), center_lm.y(),
+                                    uubot, vvbot)
+                        qp.drawLine(center_lm.x(), center_lm.y(),
+                                    uutop, vvtop)
+                    else:
+                        qp.drawLine(center_rm.x(), center_rm.y(),
+                                    uubot, vvbot)
+                        qp.drawLine(center_rm.x(), center_rm.y(),
+                                    uutop, vvtop)
+
+                # RM / LM text labels -- sized to font metrics
+                qp.setFont(self.label_font)
+                fm = _QtGui.QFontMetrics(self.label_font)
+
+                rm_spd = self.bunkers_right_vec[1]
+                lm_spd = self.bunkers_left_vec[1]
+                if self.wind_units == 'm/s':
+                    rm_spd = _tab.utils.KTS2MS(rm_spd)
+                    lm_spd = _tab.utils.KTS2MS(lm_spd)
+
+                rm_text = (_tab.utils.INT2STR(
+                    _np.float64(self.bunkers_right_vec[0]))
+                    + '/' + _tab.utils.INT2STR(rm_spd) + " RM")
+                lm_text = (_tab.utils.INT2STR(
+                    _np.float64(self.bunkers_left_vec[0]))
+                    + '/' + _tab.utils.INT2STR(lm_spd) + " LM")
+
+                h_offset = 2
+                v_offset = 5
+                pad = 2
+                rm_tw = fm.horizontalAdvance(rm_text) + pad * 2
+                lm_tw = fm.horizontalAdvance(lm_text) + pad * 2
+                th = fm.height() + pad
+
+                rm_rect = _QtCore.QRectF(
+                    ruu + h_offset, rvv + v_offset, rm_tw, th)
+                lm_rect = _QtCore.QRectF(
+                    luu + h_offset, lvv + v_offset, lm_tw, th)
+
+                # Background fill so labels are readable over the hodo traces
+                qp.fillRect(rm_rect, self.bg_color)
+                qp.fillRect(lm_rect, self.bg_color)
+
+                pen = _QtGui.QPen(self.fg_color)
+                qp.setPen(pen)
+                qp.drawText(rm_rect, _QtCore.Qt.AlignCenter, rm_text)
+                qp.drawText(lm_rect, _QtCore.Qt.AlignCenter, lm_text)
+            except Exception:
+                _orig_smv(self, qp)
+
+        _plot.drawSMV = drawSMV
+
+        # --- 4. Override paintEvent readout to use font-metrics-sized rect ---
+        _orig_paint = _plot.paintEvent
+
+        def paintEvent(self, e):
+            # The vendored paintEvent draws the cursor readout with a fixed
+            # 55x16 rect. We override it to use font metrics for sizing and
+            # the capped readout_font.
+            try:
+                draw_readout = False
+                u_interp = 0
+                xx, yy = 0, 0
+                readout = ""
+
+                if self.prof:
+                    vis = getattr(self, 'readout_visible', False)
+                    rh = getattr(self, 'readout_hght', -999.)
+                    draw_readout = vis and rh >= 0 and rh <= 12000.
+                else:
+                    draw_readout = False
+
+                if draw_readout:
+                    hght_agl = _tab.interp.to_agl(self.prof, self.hght)
+                    u_interp = _tab.interp.generic_interp_hght(
+                        self.readout_hght, hght_agl, self.u)
+                    v_interp = _tab.interp.generic_interp_hght(
+                        self.readout_hght, hght_agl, self.v)
+                    if _tab.utils.QC(u_interp):
+                        wd_interp, ws_interp = _tab.utils.comp2vec(
+                            u_interp, v_interp)
+                        if self.wind_units == 'm/s':
+                            ws_interp = _tab.utils.KTS2MS(ws_interp)
+                            units = 'm/s'
+                        else:
+                            units = 'kts'
+                        xx, yy = self.uv_to_pix(u_interp, v_interp)
+                        readout = "%03d/%02d %s" % (
+                            wd_interp, ws_interp, units)
+                    else:
+                        readout = "--/-- %s" % self.wind_units
+                        draw_readout = False
+
+                # Blit the background pixmap (same as vendored)
+                _bg.paintEvent(self, e)
+                qp = _QtGui.QPainter()
+                qp.begin(self)
+                qp.drawPixmap(0, 0, self.plotBitMap)
+
+                if draw_readout and _tab.utils.QC(u_interp):
+                    # Use a fixed small font for the readout, bypassing
+                    # self.readout_font which may be rebuilt by other code.
+                    _readout_f = _QtGui.QFont('Helvetica', readout_cap)
+                    _readout_f.setBold(True)
+                    qp.setFont(_readout_f)
+                    fm = _QtGui.QFontMetrics(_readout_f)
+                    pad = 3
+                    tw = fm.horizontalAdvance(readout) + pad * 2
+                    th = fm.height() + pad
+                    text_rect = _fit_rect_to_hodo(
+                        self, _QtCore, _QtCore.QRectF(
+                            xx + 2, yy + 5, tw, th))
+                    qp.fillRect(text_rect, self.bg_color)
+                    qp.setPen(_QtGui.QPen(self.fg_color, 1))
+                    qp.drawEllipse(_QPointF(xx, yy), 4, 4)
+                    qp.drawText(text_rect, _QtCore.Qt.AlignCenter, readout)
+
+                qp.end()
+            except Exception:
+                _orig_paint(self, e)
+
+        _plot.paintEvent = paintEvent
+
+        # --- 5. Override drawCorfidi to use font-metrics-sized rects ---
+        _orig_corfidi = _plot.drawCorfidi
+
+        def drawCorfidi(self, qp):
+            try:
+                penwidth = 1
+                pen = _QtGui.QPen(_QtGui.QColor("#00BFFF"), penwidth)
+                pen.setStyle(_QtCore.Qt.SolidLine)
+                qp.setPen(pen)
+
+                if not _np.isfinite(self.corfidi_up_u) or \
+                   not _np.isfinite(self.corfidi_up_v) or \
+                   not _np.isfinite(self.corfidi_dn_u) or \
+                   not _np.isfinite(self.corfidi_dn_v):
+                    return
+
+                up_u, up_v = self.uv_to_pix(
+                    self.corfidi_up_u, self.corfidi_up_v)
+                dn_u, dn_v = self.uv_to_pix(
+                    self.corfidi_dn_u, self.corfidi_dn_v)
+                center_up = _QPointF(up_u, up_v)
+                center_dn = _QPointF(dn_u, dn_v)
+                qp.drawEllipse(center_up, 3, 3)
+                qp.drawEllipse(center_dn, 3, 3)
+
+                # Labels sized to font metrics
+                qp.setFont(self.label_font)
+                fm = _QtGui.QFontMetrics(self.label_font)
+
+                up_spd = self.upshear[1]
+                dn_spd = self.downshear[1]
+                if self.wind_units == 'm/s':
+                    up_spd = _tab.utils.KTS2MS(up_spd)
+                    dn_spd = _tab.utils.KTS2MS(dn_spd)
+
+                up_text = ("UP="
+                           + _tab.utils.INT2STR(
+                               _np.float64(self.upshear[0]))
+                           + '/' + _tab.utils.INT2STR(up_spd))
+                dn_text = ("DN="
+                           + _tab.utils.INT2STR(
+                               _np.float64(self.downshear[0]))
+                           + '/' + _tab.utils.INT2STR(dn_spd))
+
+                h_offset = 1
+                v_offset = 3
+                pad = 2
+                up_tw = fm.horizontalAdvance(up_text) + pad * 2
+                dn_tw = fm.horizontalAdvance(dn_text) + pad * 2
+                th = fm.height() + pad
+
+                up_rect = _QtCore.QRectF(
+                    up_u + h_offset, up_v + v_offset, up_tw, th)
+                dn_rect = _QtCore.QRectF(
+                    dn_u + h_offset, dn_v + v_offset, dn_tw, th)
+
+                qp.fillRect(up_rect, self.bg_color)
+                qp.fillRect(dn_rect, self.bg_color)
+
+                pen = _QtGui.QPen(_QtGui.QColor("#00BFFF"))
+                qp.setPen(pen)
+                qp.drawText(up_rect, _QtCore.Qt.AlignCenter, up_text)
+                qp.drawText(dn_rect, _QtCore.Qt.AlignCenter, dn_text)
+            except Exception:
+                _orig_corfidi(self, qp)
+
+        _plot.drawCorfidi = drawCorfidi
+
+        _plot._sharpmod_label_fit = True
     except Exception:  # pragma: no cover - vendored module always present
         pass
 
@@ -2174,6 +3335,7 @@ def render(infile: str, outfile: str = "sharpmod_sounding.png",
         _install_custom_barbs()
         _install_hodo_0500()
         _install_hodo_zoom()
+        _install_hodo_label_fit()
         _install_skewt_level_labels_fit()
         # Condense the vendored STP graphic fonts before it is constructed.
         _install_stp_condense()
@@ -2183,6 +3345,8 @@ def render(infile: str, outfile: str = "sharpmod_sounding.png",
         # Shrink the STP prob box so it is more compact on the enlarged canvas.
         _install_stp_box_shrink()
         _install_stp_prob_box_spacing()
+        _install_conditional_prob_panel_fit()
+        _install_winter_text_fit()
         # Cap the wind-speed strip title so it never overflows on a wide strip.
         _install_speed_title_cap()
         # Cap the temp-advection strip title + axis labels for the same reason.
@@ -2191,6 +3355,7 @@ def render(infile: str, outfile: str = "sharpmod_sounding.png",
         # so background lines stop bleeding through the (wider-font) digits.
         _install_skewt_mixratio_mask()
         _install_skewt_sfc_label_mask()
+        _install_skewt_effective_layer_label_fit()
         # Redraw the white skew-T outline on top so label masks never gap it.
         _install_skewt_frame_ontop()
         # Keep the bottom isotherm labels inside the widget (no bottom clip).
@@ -2272,7 +3437,8 @@ def render(infile: str, outfile: str = "sharpmod_sounding.png",
         fd, tmp_path = tempfile.mkstemp(suffix=".png", dir=out_dir)
         os.close(fd)
         try:
-            win.spc_widget.pixmapToFile(tmp_path)
+            if not save_widget_png(win.spc_widget, tmp_path):
+                raise RenderError(infile, "Qt could not save the PNG image")
             if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
                 raise RenderError(infile, "renderer produced an empty image")
             os.replace(tmp_path, outfile)

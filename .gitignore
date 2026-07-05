@@ -17,7 +17,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg
-*.egg-info/
 .eggs/
 build/
 dist/

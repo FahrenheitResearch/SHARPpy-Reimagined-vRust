@@ -38,6 +38,8 @@ Attribute               Computation
 ``srw_sfc_500m``        :func:`winds.sfc_500m_kinematics` (tuple element 3)
 ``dcp``                 :func:`derived.dcp`
 ``lapserate_sfc_1km``   :func:`params.lapse_rate` (0->1000 m AGL)
+``vgp``                 :func:`derived.vorticity_generation_parameter`
+``wbz_height``          :func:`derived.wet_bulb_zero_height`
 ``ncape``               :func:`derived.normalized_cape_cin` (element 0)
 ``ncin``                :func:`derived.normalized_cape_cin` (element 1)
 ``ecape``               :func:`ecape.ecape`
@@ -89,6 +91,8 @@ __all__ = ["Profile", "create_profile", "DERIVED_ATTRS"]
 _SINGLE_COMPUTE = {
     "dcp": lambda prof: derived.dcp(prof),
     "lapserate_sfc_1km": lambda prof: params.lapse_rate(prof, 0, 1000, agl=True),
+    "vgp": lambda prof: derived.vorticity_generation_parameter(prof),
+    "wbz_height": lambda prof: derived.wet_bulb_zero_height(prof),
     "ecape": lambda prof: ecape_mod.ecape(prof),
     "lrghail": lambda prof: derived.large_hail_parameter(prof),
     "hpi": lambda prof: derived.hail_possibility_index(prof),

@@ -10,7 +10,7 @@ Label                   Profile attribute          Units / format
 ======================  =========================  ================
 ``DCP``                 ``prof.dcp``               unitless (0.1)
 ``LRGHAIL``             ``prof.lrghail``           unitless (0.1)
-``HPI``                 ``prof.hpi``               numeric  (0.1)
+``VGP``                 ``prof.vgp``               numeric  (0.1)
 ``Peskov``              ``prof.peskov``            numeric  (0.1)
 ``MCS``                 ``prof.mcs_index``         numeric  (0.1)
 ``EHI 0-1km``           ``prof.ehi_0_1km``         unitless (0.1)
@@ -107,7 +107,7 @@ def _fmt_int(value: float) -> str:
 DERIVED_INDEX_ROWS: Tuple[Tuple[str, str, Callable[[float], str]], ...] = (
     ("DCP", "dcp", _fmt_float1),              # Req 2.6 / 2.7
     ("LRGHAIL", "lrghail", _fmt_float1),       # Req 6.7 / 6.8
-    ("HPI", "hpi", _fmt_float1),               # Req 6.7 / 6.8
+    ("VGP", "vgp", _fmt_float1),
     ("Peskov", "peskov", _fmt_float1),         # Req 16.4 / 16.5
     ("MCS", "mcs_index", _fmt_float1),         # Req 17.4 / 17.5
     ("EHI 0-1km", "ehi_0_1km", _fmt_float1),   # Req 18.7 / 18.8
@@ -161,7 +161,7 @@ class plotDerivedIndices(QtWidgets.QFrame):
     """A ``QFrame`` index table for the new SHARPpy Reimagined derived parameters.
 
     Call :meth:`setProf` with a Profile exposing the derived attributes
-    (``dcp``, ``lrghail``, ``hpi``, ``peskov``, ``mcs_index``, ``ehi_0_1km``,
+    (``dcp``, ``lrghail``, ``vgp``, ``peskov``, ``mcs_index``, ``ehi_0_1km``,
     ``ehi_0_3km``, ``hgz_cape``, ``cape_0_6km``). The panel reads each value off
     the Profile, formats it, and draws a ``label = value`` row per parameter,
     substituting the missing-value indicator when a value is unavailable.

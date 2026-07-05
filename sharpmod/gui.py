@@ -14,10 +14,11 @@ SHARPpy "Picker" + ``SPCWindow`` experience:
 
 The only difference from :mod:`sharpmod.render` is the Qt platform: the renderer
 runs under the ``offscreen`` platform and grabs a pixmap, whereas this module
-selects the native windowing platform *before* importing the renderer so the
-same composed window is realized on screen. All of the renderer's font install,
-vendored-widget monkeypatches, layout compensation, and window-grow passes are
-reused verbatim so the interactive window matches the rendered PNG pixel-for-pixel.
+selects the native windowing platform *before* the renderer is lazily imported
+so the same composed window is realized on screen. All of the renderer's font
+install, vendored-widget monkeypatches, layout compensation, and window-grow
+passes are reused verbatim so the interactive window matches the rendered PNG
+pixel-for-pixel.
 """
 
 from __future__ import annotations
@@ -72,27 +73,20 @@ from qtpy.QtWidgets import (  # noqa: E402
     QCheckBox,
 )
 
-# Importing the renderer wires up the whole vendored widget stack and exposes
-# the font install + monkeypatch helpers we reuse. It is imported AFTER the Qt
-# platform is pinned above so the composed window is interactive, not offscreen.
-from sharpmod import render as R  # noqa: E402
-from sharpmod.viz.SPCWindow import compose_window  # noqa: E402
-from sharpmod.io import uwyo_catalog  # noqa: E402
-from sharpmod.io.uwyo_decoder import (  # noqa: E402
-    StationLookupError,
-    UWyo_Decoder,
-    UWyoError,
-)
-
 __all__ = ["PickerWindow", "compose_interactive", "main"]
 
+_render_mod = None
+_compose_window_fn = None
+_uwyo_catalog_mod = None
+_uwyo_decoder_types = None
+
 APP_NAME = "SHARPpy Reimagined"
-APP_VERSION = "0.1"
+APP_VERSION = "0.1a (20260705)"
 
 #: One-line interaction hints shown in the sounding-window tip bar.
 TIP_LINE = ("Tips:  right-click = readout / modify   \u00b7   drag points to edit"
             "   \u00b7   wheel = zoom   \u00b7   \u2190\u2009/\u2009\u2192 = step "
-            "time   \u00b7   Ctrl+E = export")
+            "time   \u00b7   Ctrl+E = export   \u00b7   Ctrl+Shift+C = copy")
 
 #: Full interaction guide (shared by the picker Help menu and the in-window
 #: "Full guide" button).
@@ -109,9 +103,135 @@ CONTROLS_HTML = (
     "<b>Keys:</b> \u2190/\u2192 step in time, \u2191/\u2193 change ensemble "
     "member, <b>Space</b> swap focus, <b>I</b> interpolate, "
     "<b>C</b> collect observed, <b>W</b> back to the picker.<br><br>"
-    "<b>Export:</b> the <b>Export</b> menu saves a PNG image (<b>Ctrl+E</b>) or "
+    "<b>Export:</b> the <b>Export</b> menu saves a PNG image (<b>Ctrl+E</b>), "
+    "copies the current view to the clipboard (<b>Ctrl+Shift+C</b>), or writes "
     "an SPC tabular text file that loads back into the app "
     "(File \u2192 Save Image / Save Text also work).")
+
+PICKER_DARK_QSS = """
+QMainWindow, QWidget {
+    background: #10141c;
+    color: #e7edf5;
+    font-family: "Segoe UI", "Arial";
+}
+QMenuBar, QMenu {
+    background: #151b25;
+    color: #e7edf5;
+    border: 1px solid #273244;
+}
+QMenuBar::item:selected, QMenu::item:selected {
+    background: #263247;
+}
+QTabWidget::pane {
+    border: 1px solid #263247;
+    background: #10141c;
+}
+QTabBar::tab {
+    background: #182131;
+    color: #b8c5d6;
+    padding: 8px 14px;
+    border: 1px solid #263247;
+    border-bottom: 0;
+}
+QTabBar::tab:selected {
+    background: #223047;
+    color: #ffffff;
+}
+QGroupBox {
+    border: 1px solid #2a374b;
+    border-radius: 6px;
+    margin-top: 14px;
+    padding: 10px 8px 8px 8px;
+    background: #151b25;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+    color: #d5e0ef;
+}
+QLineEdit, QComboBox, QDateEdit, QListWidget {
+    background: #0c1118;
+    color: #edf3fb;
+    border: 1px solid #2b3950;
+    border-radius: 5px;
+    padding: 6px;
+    selection-background-color: #315d8f;
+}
+QListWidget::item {
+    padding: 5px;
+}
+QListWidget::item:selected {
+    background: #315d8f;
+    color: #ffffff;
+}
+QPushButton, QToolButton {
+    background: #24334a;
+    color: #f4f8ff;
+    border: 1px solid #3a4e6b;
+    border-radius: 5px;
+    padding: 6px 10px;
+}
+QPushButton:hover, QToolButton:hover {
+    background: #2f4564;
+}
+QPushButton:pressed, QToolButton:pressed {
+    background: #1b283b;
+}
+QPushButton:disabled, QToolButton:disabled, QLineEdit:disabled, QComboBox:disabled {
+    color: #6f7d8f;
+    background: #151b25;
+    border-color: #253044;
+}
+QStatusBar {
+    background: #0c1118;
+    color: #aebbd0;
+    border-top: 1px solid #263247;
+}
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: #10141c;
+    width: 12px;
+    height: 12px;
+}
+QScrollBar::handle {
+    background: #334258;
+    border-radius: 5px;
+}
+"""
+
+SOUNDING_LIGHT_QSS = """
+QMainWindow {
+    background: #f3f6fa;
+    color: #18202c;
+}
+QMenuBar, QMenu {
+    background: #ffffff;
+    color: #18202c;
+    border: 1px solid #d7dde6;
+}
+QMenuBar::item:selected, QMenu::item:selected {
+    background: #e8eef7;
+}
+QStatusBar {
+    background: #ffffff;
+    color: #39475a;
+    border-top: 1px solid #d7dde6;
+}
+QScrollArea {
+    background: #f3f6fa;
+    border: 0;
+}
+QToolButton {
+    background: transparent;
+    border: 0;
+    color: #34506f;
+    padding: 2px 5px;
+}
+QToolButton:hover {
+    background: #e8eef7;
+    border-radius: 4px;
+}
+"""
 
 
 def _show_controls_dialog(parent) -> None:
@@ -145,6 +265,46 @@ def _most_recent_synoptic() -> tuple[QDate, int]:
     return QDate(d.year, d.month, d.day), h
 
 
+def _render():
+    """Import the heavy renderer stack on first use, not at picker startup."""
+    global _render_mod
+    if _render_mod is None:
+        from sharpmod import render as render_mod
+        _render_mod = render_mod
+    return _render_mod
+
+
+def _compose_window():
+    """Return the SPCWindow composer, loading the vendored UI stack lazily."""
+    global _compose_window_fn
+    if _compose_window_fn is None:
+        from sharpmod.viz.SPCWindow import compose_window as compose_window_fn
+        _compose_window_fn = compose_window_fn
+    return _compose_window_fn
+
+
+def _uwyo_catalog():
+    """Return the bundled station catalogue module, imported on first use."""
+    global _uwyo_catalog_mod
+    if _uwyo_catalog_mod is None:
+        from sharpmod.io import uwyo_catalog as catalog_mod
+        _uwyo_catalog_mod = catalog_mod
+    return _uwyo_catalog_mod
+
+
+def _uwyo_decoder_classes():
+    """Return UWyo decoder classes, deferring network/decoder imports."""
+    global _uwyo_decoder_types
+    if _uwyo_decoder_types is None:
+        from sharpmod.io.uwyo_decoder import (
+            StationLookupError,
+            UWyo_Decoder,
+            UWyoError,
+        )
+        _uwyo_decoder_types = (StationLookupError, UWyo_Decoder, UWyoError)
+    return _uwyo_decoder_types
+
+
 # ===========================================================================
 # Shared window composition (reuses the renderer setup, but shows on screen)
 # ===========================================================================
@@ -158,6 +318,7 @@ def _ensure_setup(app) -> None:
     row-spacing patch. Idempotent -- safe to call before every sounding.
     """
     global _setup_done
+    R = _render()
     # Fonts must be (re)asserted on the live QApplication; cheap + idempotent.
     R.install_font(app)
     if _setup_done:
@@ -169,12 +330,16 @@ def _ensure_setup(app) -> None:
     R._install_custom_barbs()
     R._install_hodo_0500()
     R._install_hodo_zoom()
+    R._install_hodo_label_fit()
     R._install_skewt_level_labels_fit()
     R._install_stp_condense()
     R._install_stp_label_rename()
     R._install_stp_xlabel_colors()
     R._install_stp_bottom_margin()
     R._install_stp_box_shrink()
+    R._install_stp_prob_box_spacing()
+    R._install_conditional_prob_panel_fit()
+    R._install_winter_text_fit()
     # Cap the wind-speed + temp-advection strip fonts so their titles/axis
     # labels stay tidy at any strip width (matches the PNG render path).
     R._install_speed_title_cap()
@@ -183,6 +348,7 @@ def _ensure_setup(app) -> None:
     # background lines stop bleeding through the (wider-font) digits.
     R._install_skewt_mixratio_mask()
     R._install_skewt_sfc_label_mask()
+    R._install_skewt_effective_layer_label_fit()
     # Redraw the white skew-T outline on top so label masks never gap it.
     R._install_skewt_frame_ontop()
     # Keep the bottom isotherm labels inside the widget (no bottom clip).
@@ -219,6 +385,12 @@ def _fill_metadata(prof_col, stn_id, model=None, run=None, loc=None) -> None:
         prof_col.setMeta("model", "Archive" if observed else "Model")
 
 
+def _settle_layout_events(app, passes: int = 2) -> None:
+    """Let Qt apply pending layout/resize work between manual grow passes."""
+    for _ in range(max(1, passes)):
+        app.processEvents()
+
+
 def compose_interactive(config, prof_col, controller, *, stn_id=None,
                         model=None, run=None, loc=None):
     """Compose and show a fully interactive SPC-style sounding window.
@@ -238,6 +410,7 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     shown). The caller must retain both it and ``controller``.
     """
     app = QApplication.instance()
+    R = _render()
     _ensure_setup(app)
 
     _fill_metadata(prof_col, stn_id, model=model, run=run, loc=loc)
@@ -245,7 +418,7 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     # mount=True appends the derived-parameter family panels into the vendored
     # index band and attaches the skew-T HGZ overlay; controller=picker wires
     # the config/preferences/focus contract to the picker window.
-    win, _ = compose_window(config, prof_col, mount=True, controller=controller)
+    win, _ = _compose_window()(config, prof_col, mount=True, controller=controller)
 
     # The vendored SPCWindow.__initUI calls self.show() as soon as it is
     # constructed, so an empty white window flashes on screen while we still
@@ -262,6 +435,7 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     except Exception:
         loc_lbl = stn_id
     win.setWindowTitle(f"{APP_NAME} \u2014 {loc_lbl or 'Sounding'}")
+    win.setStyleSheet(SOUNDING_LIGHT_QSS)
     try:
         for _lbl in win.findChildren(QLabel):
             if _lbl.text().startswith("SHARPpy"):
@@ -277,12 +451,13 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     # The five legacy layout-compensation passes, then grow the canvas so the
     # family panels + barbs fit -- identical to the PNG path.
     R.apply_layout_compensation(win.spc_widget)
+    _settle_layout_events(app)
     R._grow_for_family_panels(win)
+    _settle_layout_events(app)
     # Grow the canvas the same way the PNG renderer does, so the interactive
     # window's skew-T / hodograph sizing matches the rendered image.
     R.enlarge_canvas(win)
-    for _ in range(6):
-        app.processEvents()
+    _settle_layout_events(app, 6)
 
     # A discoverable Export menu with sensible default filenames/locations
     # (the vendored Save Image/Text default to a hidden temp dir with no name).
@@ -297,11 +472,10 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     # how-to). Done last so it wraps the fully composed spc_widget.
     _install_tip_bar(win, controller)
 
-    # Keep the sounding at its natural (CLI-identical) size inside a scroll area
-    # and size the window to fit the screen. Without this, a window taller than
-    # the screen work area gets clamped by the OS and the vendored panel layout
-    # squishes the Skew-T (the family-panel minimum heights hold, so the plot
-    # collapses vertically). The scroll area guarantees no squish.
+    # Keep the real sounding widget at its natural (CLI-identical) size inside
+    # a non-resizing scroll host. Letting the Windows QMainWindow/graphics proxy
+    # recompute the child geometry snaps the canvas back to SHARPpy's flatter
+    # 1180x800-era size and squishes the Skew-T/hodograph.
     _fit_window_to_screen(app, win)
 
     win.showNormal()
@@ -310,16 +484,42 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     return win
 
 
-def _fit_window_to_screen(app, win) -> None:
-    """Show the sounding at its natural, PNG-identical size (crisp, no squish).
+class _FixedSoundingScrollArea(QScrollArea):
+    """Host the composed sounding at its settled CLI geometry."""
 
-    The vendored ``spc_widget`` is pinned to its composed (natural) size and
-    hosted in a non-resizing :class:`QScrollArea`. At natural size the
-    interactive window is pixel-identical to the headless render -- crisp text,
-    correct Skew-T / hodograph proportions. The window opens at natural size,
-    clamped only to the available screen work area; on a screen large enough
-    (the common case) it fills exactly with no scrollbars, and on a smaller
-    screen a scrollbar appears instead of the plot being squished or blurred.
+    def __init__(self, widget, natural_size, parent=None):
+        super().__init__(parent)
+        self._widget = widget
+        self._natural_size = QSize(max(1, natural_size.width()),
+                                   max(1, natural_size.height()))
+        self.setFrameShape(QFrame.NoFrame)
+        self.setWidgetResizable(False)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("QScrollArea{background:#f3f6fa;border:0;}")
+        self._lock_widget_size()
+        self.setWidget(widget)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._lock_widget_size()
+        super().resizeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._lock_widget_size()
+        super().showEvent(event)
+
+    def _lock_widget_size(self) -> None:
+        self._widget.setFixedSize(self._natural_size)
+        if self._widget.size() != self._natural_size:
+            self._widget.resize(self._natural_size)
+
+
+def _fit_window_to_screen(app, win) -> None:
+    """Display the sounding without changing its native layout/export.
+
+    The vendored ``spc_widget`` remains fixed at the composed natural size, so
+    the Skew-T, hodograph, and index panels keep the same proportions used by
+    the CLI PNG renderer. Smaller screens get scrollbars instead of layout
+    compression.
     """
     sw = getattr(win, "spc_widget", None)
     if sw is None:
@@ -328,22 +528,28 @@ def _fit_window_to_screen(app, win) -> None:
     if nat_w <= 1 or nat_h <= 1:
         return
     try:
-        # Pin the sounding to its natural size so nothing can squish it.
-        sw.setMinimumSize(nat_w, nat_h)
+        # Pin the sounding to its settled render size so no child layout can
+        # squish it back to the vendored Windows geometry.
+        natural = QSize(nat_w, nat_h)
+        sw.setFixedSize(natural)
 
-        scroll = QScrollArea()
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidgetResizable(False)
-        scroll.setAlignment(Qt.AlignCenter)
-        scroll.setStyleSheet("QScrollArea{background:#000000;border:0;}")
-        scroll.setWidget(sw)
+        # Detach the original central widget before re-parenting it into the
+        # graphics scene; otherwise QMainWindow may delete it when replacing the
+        # central widget.
+        old_central = win.takeCentralWidget()
+        if old_central is not None and old_central is not sw:
+            old_central.setParent(None)
+        sw.setParent(None)
+
+        scroll = _FixedSoundingScrollArea(sw, natural, win)
         win.setCentralWidget(scroll)
 
         mb_h = win.menuBar().height() or 0
         screen = app.primaryScreen().availableGeometry()
         max_w = int(screen.width() * 0.98)
         max_h = int(screen.height() * 0.96)
-        # +2 for the viewport frame; scrollbars appear only when truly needed.
+        # Open at the CLI-render size when the screen can hold it; otherwise
+        # clamp and rely on scrollbars instead of resizing the sounding.
         win_w = min(nat_w + 2, max_w)
         win_h = min(nat_h + mb_h + 2, max_h)
         win.resize(win_w, win_h)
@@ -377,21 +583,21 @@ def _install_tip_bar(win, controller) -> None:
         h.setSpacing(8)
 
         lbl = QLabel(TIP_LINE)
-        lbl.setStyleSheet("color:#9fb6d6; font-size:11px;")
+        lbl.setStyleSheet("color:#47566b; font-size:11px;")
         lbl.setWordWrap(False)
 
         guide_btn = QToolButton()
         guide_btn.setText("Full guide")
         guide_btn.setToolTip("Show all sounding-window controls")
         guide_btn.setAutoRaise(True)
-        guide_btn.setStyleSheet("QToolButton{color:#cfe0f5;}")
+        guide_btn.setStyleSheet("QToolButton{color:#34506f;}")
         guide_btn.clicked.connect(lambda: _show_controls_dialog(win))
 
         close_btn = QToolButton()
         close_btn.setText("\u2715")
         close_btn.setToolTip("Hide these tips")
         close_btn.setAutoRaise(True)
-        close_btn.setStyleSheet("QToolButton{color:#9fb6d6;}")
+        close_btn.setStyleSheet("QToolButton{color:#66758a;}")
 
         h.addWidget(lbl)
         h.addWidget(guide_btn)
@@ -594,6 +800,7 @@ def _install_export_menu(win, prof_col, controller) -> None:
     -- and the text export writes the focused profile as an SPC tabular file
     that loads back into the app.
     """
+    R = _render()
     settings = getattr(controller, "_settings", None)
     base = _default_export_basename(prof_col)
 
@@ -609,6 +816,12 @@ def _install_export_menu(win, prof_col, controller) -> None:
         if settings is not None:
             settings.setValue("export_dir", os.path.dirname(path))
 
+    def _notify(message: str) -> None:
+        try:
+            win.statusBar().showMessage(message, 4000)
+        except Exception:
+            pass
+
     def export_image() -> None:
         start = os.path.join(_start_dir(), base + ".png")
         fn, _ok = QFileDialog.getSaveFileName(
@@ -616,8 +829,21 @@ def _install_export_menu(win, prof_col, controller) -> None:
         if fn:
             if not fn.lower().endswith(".png"):
                 fn += ".png"
-            win.spc_widget.pixmapToFile(fn)
-            _remember(fn)
+            if R.save_widget_png(win.spc_widget, fn):
+                _remember(fn)
+                _notify(f"Exported image to {fn}")
+            else:
+                QMessageBox.warning(win, APP_NAME,
+                                    f"Could not export image:\n{fn}")
+
+    def copy_image() -> None:
+        try:
+            pixmap = R.grab_widget_pixmap(win.spc_widget)
+            QApplication.clipboard().setPixmap(pixmap)
+            _notify("Sounding image copied to clipboard")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(win, APP_NAME,
+                                f"Could not copy image:\n{exc}")
 
     def export_text() -> None:
         start = os.path.join(_start_dir(), base + ".txt")
@@ -640,6 +866,10 @@ def _install_export_menu(win, prof_col, controller) -> None:
         act_img.setShortcut("Ctrl+E")
         act_img.triggered.connect(export_image)
         menu.addAction(act_img)
+        act_copy = QAction("Copy Image to Clipboard", win)
+        act_copy.setShortcut("Ctrl+Shift+C")
+        act_copy.triggered.connect(copy_image)
+        menu.addAction(act_copy)
         act_txt = QAction("Export Text (SPC tabular)\u2026", win)
         act_txt.triggered.connect(export_text)
         menu.addAction(act_txt)
@@ -667,6 +897,11 @@ class _FetchWorker(QThread):
         self._when = when_utc
 
     def run(self):  # noqa: D401 - QThread entry point
+        try:
+            StationLookupError, UWyo_Decoder, UWyoError = _uwyo_decoder_classes()
+        except Exception as exc:  # noqa: BLE001 - surface import/freezer issues
+            self.failed.emit(f"UWyo decoder is unavailable: {exc}")
+            return
         try:
             decoder = UWyo_Decoder(full_catalog=True)
             meta = decoder.resolve_station(self._query)
@@ -1123,6 +1358,7 @@ class PickerWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} \u2014 Sounding Picker")
         self.resize(1000, 720)
+        self.setStyleSheet(PICKER_DARK_QSS)
         self.setAcceptDrops(True)  # drag a sounding file onto the window
 
         # Keep every opened sounding window alive. Each vendored ``SPCWindow`` is
@@ -1131,12 +1367,12 @@ class PickerWindow(QMainWindow):
         self._viewers: list = []
         self._worker: _FetchWorker | None = None
         self._settings = QSettings("SHARPpyReimagined", "GUI")
-        self._all_stations = uwyo_catalog.all_stations()
+        self._all_stations = _uwyo_catalog().all_stations()
 
         # The one shared render/display config, owned by the controller (this
-        # window). Built once here -- mirrors the renderer bootstrap -- and
-        # mutated in place by the Preferences dialog.
-        self.config = R.build_config(tempfile.gettempdir())
+        # window). Built lazily on first sounding/preference use so the picker
+        # window appears before the heavy render stack is imported.
+        self.config = None
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_map_tab(), "Station Map")
@@ -1198,27 +1434,39 @@ class PickerWindow(QMainWindow):
         sounding window refreshes its profiles and palette.
         """
         try:
+            config = self._config()
             from sharppy.viz.preferences import PrefDialog
         except Exception as exc:  # pragma: no cover - vendored dep always present
             QMessageBox.warning(self, APP_NAME,
                                 f"Preferences are unavailable:\n{exc}")
             return
-        dialog = PrefDialog(self.config, parent=self)
+        dialog = PrefDialog(config, parent=self)
         dialog.exec()
         # Keep the fork's legibility substitutions after any palette change.
         try:
             from sharpmod import colors
-            self.config["preferences", "alert_l1_color"] = colors.ALERT_L1_COLOR
-            self.config["preferences", "alert_l2_color"] = colors.ALERT_L2_COLOR
+            config["preferences", "alert_l1_color"] = colors.ALERT_L1_COLOR
+            config["preferences", "alert_l2_color"] = colors.ALERT_L2_COLOR
         except Exception:
             pass
-        self.config_changed.emit(self.config)
+        self.config_changed.emit(config)
 
     def focusPicker(self) -> None:  # noqa: N802 - matches SPCWindow's caller
         """Bring the picker back to the front (the ``W`` key target)."""
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def _config(self):
+        """Build and cache the shared render config on first real use."""
+        if self.config is None:
+            try:
+                self.statusBar().showMessage("Loading analysis engine\u2026")
+                QApplication.processEvents()
+            except Exception:
+                pass
+            self.config = _render().build_config(tempfile.gettempdir())
+        return self.config
 
     # ====================================================================== #
     # Station Map tab (legacy-SHARPpy style)
@@ -1544,6 +1792,7 @@ class PickerWindow(QMainWindow):
         # (which briefly blocks the UI thread while the SPC window is built).
         QApplication.processEvents()
         try:
+            R = _render()
             prof_col, stn_id = R.decode(npz_path)
             title = f"{APP_NAME} \u2014 {meta.id} {when:%Y-%m-%d %H}Z"
             self._show_sounding(prof_col, stn_id, title=title)
@@ -1627,6 +1876,8 @@ class PickerWindow(QMainWindow):
         self.statusBar().showMessage(f"Decoding {os.path.basename(path)}\u2026")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
+            QApplication.processEvents()
+            R = _render()
             prof_col, stn_id = R.decode(path)
         except Exception as exc:  # noqa: BLE001
             QApplication.restoreOverrideCursor()
@@ -1695,7 +1946,7 @@ class PickerWindow(QMainWindow):
         # Compose the real, interactive SPCWindow with this picker as its Qt
         # parent/controller (so the W key refocuses the picker and Preferences
         # routes here). The window shows itself; we retain a reference.
-        win = compose_interactive(self.config, prof_col, self, stn_id=stn_id)
+        win = compose_interactive(self._config(), prof_col, self, stn_id=stn_id)
         if title:
             win.setWindowTitle(title)
         self._prune_closed_viewers()

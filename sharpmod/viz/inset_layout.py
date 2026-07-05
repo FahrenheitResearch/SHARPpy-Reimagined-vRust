@@ -9,7 +9,11 @@ those boxes, so the text is clipped:
 * Theta-E pressure labels (e.g. ``500``-``900``) are right-aligned in a 20 px
   box, so the leading digit is cut off on the left edge.
 * Theta-E theta-e labels (e.g. ``300``-``350``) live in a 15 px box, so they are
-  cut off along the bottom.
+  cut off along the bottom; in the live GUI they can also overlap each other
+  when every 10 K tick fits individually but the inset is too narrow for all
+  of their text boxes.
+* The SR-Wind title is drawn in a fixed 45x35 px box, which clips the normal
+  inset label font.
 * The SR-Wind "Classic Supercell" annotation is drawn in a 50 px box anchored at
   the 40 kt line, which overflows the right edge on a narrow inset.
 
@@ -83,16 +87,28 @@ def apply() -> bool:
         qp.drawLine(x1, 0, x1, 0 + offset)
         qp.drawLine(x1, self.bry + self.tpad - offset, x1, self.bry + self.rpad)
         # Drop the label into the empty bottom padding band, centered on the
-        # tick and unclipped, so it is fully visible instead of cut off. Skip
-        # the label entirely when its centered box would spill past either
-        # frame edge (e.g. the leftmost "300" tick), so it is dropped rather
-        # than drawn half-clipped.
-        box_w = 50
-        left = int(x1) - box_w // 2
-        if left >= self.tlx and left + box_w <= self.brx:
-            qp.drawText(left, int(self.bry) + 3, box_w, 16,
+        # tick and unclipped, so it is fully visible instead of cut off. Also
+        # keep a running right edge for this background draw: a live GUI inset
+        # can be narrower than the CLI image while still fitting each label
+        # individually, which makes "300 310 320 ..." collide unless
+        # intermediate labels are suppressed.
+        if t <= 200:
+            self._sharpmod_thetae_last_label_right = self.tlx - 9999
+        label = utils.INT2STR(t)
+        fm = QtGui.QFontMetrics(self.label_font)
+        _adv = getattr(fm, "horizontalAdvance", None) or fm.width
+        box_w = max(30, int(_adv(label)) + 8)
+        box_h = max(16, int(fm.height()))
+        left = int(round(float(x1) - box_w / 2.0))
+        right = left + box_w
+        last_right = getattr(
+            self, "_sharpmod_thetae_last_label_right", self.tlx - 9999)
+        gap = 3
+        if left >= self.tlx and right <= self.brx and left >= last_right + gap:
+            qp.drawText(left, int(self.bry) + 3, box_w, box_h,
                         DONT_CLIP | Align.AlignHCenter | Align.AlignTop,
-                        utils.INT2STR(t))
+                        label)
+            self._sharpmod_thetae_last_label_right = right
 
     # -- SR-Wind inset ----------------------------------------------------- #
 
@@ -111,32 +127,19 @@ def apply() -> bool:
 
     def _winds_draw_frame(self, qp):
         """Frame + title identical to upstream, but the "SR Wind v. Height"
-        title is drawn with a shrunk font in a fit-to-text box so it is no
-        longer clipped, and the Classic Supercell annotation is clamped inside
-        the widget so it never spills off-edge."""
+        title is drawn in the same title box as the adjacent Theta-E inset
+        using the normal inset label font, and the Classic Supercell annotation
+        is clamped inside the widget so it never spills off-edge."""
         pen = QtGui.QPen(self.fg_color, 2, Pen.SolidLine)
         qp.setPen(pen)
-        # Upstream sizes the title from the widget height (round(h*0.0512)),
-        # so on a large / high-DPI inset the 3-line title outgrows its fixed
-        # 45x35 px box and is clipped ("SR Wind v. Height" cut off). Draw it in
-        # a smaller, dedicated font and a box sized to the text so every line
-        # is fully visible, anchored in the top-left corner like upstream.
+        # Upstream SR-Wind anchors this title at (15, 5, 45, 35), which makes
+        # it sit higher and farther left than the adjacent Theta-E title at
+        # (35, 15, 50, 50). Use the Theta-E title box and TextDontClip so the
+        # normal label font keeps the same visual placement without clipping.
         title_font = QtGui.QFont(self.label_font)
-        pt = self.label_font.pointSize()
-        if pt and pt > 0:
-            title_font.setPointSize(max(6, int(round(pt * 0.7))))
-        else:
-            px = self.label_font.pixelSize()
-            if px and px > 0:
-                title_font.setPixelSize(max(8, int(round(px * 0.7))))
         qp.setFont(title_font)
-        fm = QtGui.QFontMetrics(title_font)
-        _adv = getattr(fm, "horizontalAdvance", None) or fm.width
-        line_h = fm.height()
-        tw = max(_adv('SR Wind'), _adv('Height')) + 6
-        th = line_h * 3 + 4
-        qp.drawText(int(self.tlx) + 2, int(self.tly) + 2, tw, th,
-                    DONT_CLIP | Align.AlignTop | Align.AlignHCenter,
+        qp.drawText(int(self.tlx) + 35, int(self.tly) + 15, 50, 50,
+                    DONT_CLIP | Align.AlignVCenter | Align.AlignHCenter,
                     'SR Wind\nv.\nHeight')
         qp.setFont(self.label_font)
         ## frame borders (unchanged)

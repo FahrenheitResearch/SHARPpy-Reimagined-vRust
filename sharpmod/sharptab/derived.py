@@ -48,6 +48,8 @@ Contract (Requirements 2.1, 2.2, 2.4, 2.5):
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import numpy.ma as ma
 
@@ -59,6 +61,8 @@ __all__ = [
     "dcp",
     "normalized_cape_cin",
     "ehi",
+    "vorticity_generation_parameter",
+    "wet_bulb_zero_height",
     "large_hail_parameter",
     "hail_possibility_index",
     "peskov_index",
@@ -75,6 +79,7 @@ _SHEAR_NORM = 20.0      # kt (0-6 km bulk shear)
 _MNWIND_NORM = 16.0     # kt (0-6 km mean wind speed)
 
 _SFC_TOP_AGL = 6000.0   # SFC->6 km AGL layer top
+_VGP_TOP_AGL = 4000.0   # SFC->4 km AGL layer top for VGP shear
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +642,54 @@ def _profile_columns(prof):
             _sub(wdir), _sub(wspd))
 
 
+# ---------------------------------------------------------------------------
+# Vorticity Generation Parameter (VGP)
+# ---------------------------------------------------------------------------
+
+def vorticity_generation_parameter(prof):
+    """Compute the Vorticity Generation Parameter (VGP) for ``prof``.
+
+    VGP is evaluated as ``sqrt(SBCAPE) * (0-4 km bulk shear / 4000 m)``, with
+    CAPE in ``m^2/s^2`` and the SFC->4 km shear converted from knots to metres
+    per second before dividing by layer depth. The result is commonly displayed
+    in sounding diagnostics as a compact severe-storm composite. Missing CAPE,
+    wind, or height coverage returns :data:`MISSING`; the function never raises.
+    """
+    try:
+        return _vgp_impl(prof)
+    except Exception:
+        return MISSING
+
+
+def _vgp_impl(prof):
+    pbot = _sfc_pres(prof)
+    ptop = interp.pres_at_hght_agl(prof, _VGP_TOP_AGL)
+    if is_missing(pbot) or is_missing(ptop):
+        return MISSING
+
+    du, dv = winds.wind_shear(prof, pbot, ptop)
+    if is_missing(du) or is_missing(dv):
+        return MISSING
+    shear_kt = float(winds.mag(du, dv))
+    if not np.isfinite(shear_kt):
+        return MISSING
+
+    arrays = _profile_columns(prof)
+    if arrays is None:
+        return MISSING
+    cape = _sfc_cape(*arrays)
+    if cape is None or not np.isfinite(cape) or cape < 0.0:
+        return MISSING
+    if cape == 0.0:
+        return 0.0
+
+    shear_s = float(winds.kts2ms(shear_kt)) / _VGP_TOP_AGL
+    value = math.sqrt(cape) * shear_s
+    if not np.isfinite(value):
+        return MISSING
+    return float(value)
+
+
 # ===========================================================================
 # Hail / thunderstorm / MCS composite indices -- task 7.6
 # ===========================================================================
@@ -786,6 +839,45 @@ def _finite_or_none(value):
     return fval if np.isfinite(fval) else None
 
 
+def wet_bulb_zero_height(prof):
+    """Return the wet-bulb-zero height in metres AGL for ``prof``.
+
+    The direct path uses an optional ``prof.wetbulb`` column when a decoder
+    supplied one. Most inputs do not carry that column, so the fallback builds
+    the same SHARPpy oracle profile used by the hail composites and asks it for
+    the first wet-bulb 0 C level. Missing inputs return :data:`MISSING`; the
+    function never raises.
+    """
+    try:
+        return _wet_bulb_zero_height_impl(prof)
+    except Exception:
+        return MISSING
+
+
+def _wet_bulb_zero_height_impl(prof):
+    if getattr(prof, "wetbulb", None) is not None:
+        h_msl = interp.hght_at_isotherm(prof, 0, wetbulb=True)
+        h_agl = _finite_or_none(interp.to_agl(prof, h_msl))
+        if h_agl is not None:
+            return h_agl
+
+    sp = _oracle_profile(prof)
+    if sp is None:
+        return MISSING
+
+    try:
+        from sharppy.sharptab import params as sp_params
+        from sharppy.sharptab import interp as sp_interp
+        wbz_pres = sp_params.temp_lvl(sp, 0, wetbulb=True)
+        wbz_agl = _finite_or_none(
+            sp_interp.to_agl(sp, sp_interp.hght(sp, wbz_pres))
+        )
+    except Exception:
+        return MISSING
+
+    return MISSING if wbz_agl is None else float(wbz_agl)
+
+
 # ---------------------------------------------------------------------------
 # LRGHAIL -- SPC Large Hail Parameter (Johnson & Sugden 2014 / help_lghl)
 # ---------------------------------------------------------------------------
@@ -855,12 +947,6 @@ def hail_possibility_index(prof):
 
 
 def _hail_possibility_index_impl(prof):
-    sp = _oracle_profile(prof)
-    if sp is None:
-        return MISSING
-
-    from sharppy.sharptab import params as sp_params
-    from sharppy.sharptab import interp as sp_interp
     from . import params as sm_params
 
     # Hail-growth-zone CAPE (-10 -> -30 degrees C). Returns MISSING when the
@@ -870,13 +956,7 @@ def _hail_possibility_index_impl(prof):
         return MISSING
 
     # Wet-bulb-zero height (m AGL): the melting level (Fawbush-Miller predictor).
-    try:
-        wbz_pres = sp_params.temp_lvl(sp, 0, wetbulb=True)
-        wbz_agl = _finite_or_none(
-            sp_interp.to_agl(sp, sp_interp.hght(sp, wbz_pres))
-        )
-    except Exception:
-        return MISSING
+    wbz_agl = _finite_or_none(wet_bulb_zero_height(prof))
     if wbz_agl is None:
         return MISSING
 

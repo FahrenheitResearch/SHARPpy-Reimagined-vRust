@@ -63,7 +63,7 @@ def qt_app():
 _FULL_DERIVED = SimpleNamespace(
     dcp=1.5,
     lrghail=2.3,
-    hpi=4.7,
+    vgp=0.4,
     peskov=0.8,
     mcs_index=3.1,
     ehi_0_1km=1.2,
@@ -139,7 +139,7 @@ def test_derived_rows_show_all_present_values():
     rows = dict(derived_rows(_FULL_DERIVED))
     assert rows["DCP"] == "1.5"
     assert rows["LRGHAIL"] == "2.3"
-    assert rows["HPI"] == "4.7"
+    assert rows["VGP"] == "0.4"
     assert rows["Peskov"] == "0.8"
     assert rows["MCS"] == "3.1"
     assert rows["EHI 0-1km"] == "1.2"
@@ -160,7 +160,7 @@ def test_derived_rows_missing_value_shows_indicator(missing_value):
     """A missing/masked/non-finite value renders the '--' indicator (22.1)."""
     prof = SimpleNamespace(
         dcp=missing_value,
-        lrghail=2.3, hpi=4.7, peskov=0.8, mcs_index=3.1,
+        lrghail=2.3, vgp=0.4, peskov=0.8, mcs_index=3.1,
         ehi_0_1km=1.2, ehi_0_3km=2.6, hgz_cape=350.0, cape_0_6km=1800.0,
     )
     rows = dict(derived_rows(prof))

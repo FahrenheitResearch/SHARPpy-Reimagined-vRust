@@ -11,8 +11,8 @@ Columns:
   2. Kinematics  -- SRH/Shear/MnWind/SRW table (SFC-500m first -- derived),
      BRN Shear / 4-6km SR wind, the Storm-Motion vectors, and the coloured
      Supercell / STP(cin) / STP(fix) / SHIP / DCP severe box.
-  3. Composite Indices -- the SHARPpy Reimagined-derived composites: EHI 0-1/0-3km, HPI,
-     LRGHAIL, Peskov, MCS, then HGZ CAPE / NCAPE / NCIN / ECAPE.
+  3. Composite Indices -- the SHARPpy Reimagined-derived composites: EHI 0-1/0-3km, VGP,
+     LRGHAIL, Peskov, MCS, then HGZ CAPE / NCAPE / WBZ Height / ECAPE.
 
 Existing values are read from the analyzed SHARPpy convective profile; the new
 ones from the SHARPpy Reimagined derived Profile. Nothing is recomputed (Req 13.3);
@@ -843,22 +843,21 @@ class IndexBoard(QFrame):
         swt = self._sweat()
         top = [("EHI 0-1km", f1(ehi1), self._ehi_color(ehi1)),
                ("EHI 0-3km", f1(ehi3), self._ehi_color(ehi3)),
-               ("Hail Psbl Index", f1(self._d("hpi")), self.fg),
+               ("VGP", f1(self._d("vgp")), self.fg),
                ("LRGHAIL", f1(lrgh), self._lrghail_color(lrgh)),
                ("Peskov Index", f1(pesk), self._peskov_color(pesk)),
                ("MCS Index", f1(mcs), self._mcs_color(mcs)),
                ("SWEAT", i0(swt), self._sweat_color(swt))]
         hgz = self._d("hgz_cape")
         ncape = self._d("ncape")
-        ncin = self._d("ncin")
+        wbz = self._d("wbz_height")
         ecape = self._d("ecape")
-        # HGZ CAPE / NCAPE / NCIN / ECAPE on the white->yellow->red->pink scale.
+        # CAPE-energy rows use the white->yellow->red->pink scale; WBZ is neutral.
         bot = [("HGZ CAPE", i0(hgz), " J/kg",
                 self._wyrp(hgz, 1000, 2500, 4000, higher=True)),
                ("NCAPE", f1(ncape), " J/kg/m",
                 self._wyrp(ncape, 0.1, 0.2, 0.3, higher=True)),
-               ("NCIN", f1(ncin), " J/kg/m",
-                self._wyrp(ncin, -0.6, -0.3, -0.1, higher=True)),
+               ("WBZ Height", i0(wbz), " m AGL", self.fg),
                ("ECAPE", i0(ecape), " J/kg",
                 self._wyrp(ecape, 1000, 2500, 4000, higher=True))]
         # SHIP box-and-whisker chart at the TOP (above the EHI indices), then
