@@ -44,7 +44,6 @@ from __future__ import annotations
 import math
 import re
 import socket
-import ssl
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.error import URLError
@@ -53,14 +52,9 @@ from urllib.request import urlopen
 
 import numpy as np
 
-try:  # certifi is a declared runtime dependency; fall back gracefully.
-    import certifi
-    _CA_FILE = certifi.where()
-except Exception:  # pragma: no cover - certifi always present in practice
-    _CA_FILE = None
-
 from sharpmod.sharptab import profile as _profile
 from sharpmod.io import uwyo_catalog as _catalog
+from sharpmod.io.tls import create_ssl_context
 
 __all__ = [
     "UWyo_Decoder",
@@ -384,8 +378,8 @@ class UWyo_Decoder:
         Any connection failure, timeout, or transport error is surfaced as a
         :class:`RetrievalError` (Requirement 7.6).
         """
-        context = ssl.create_default_context(cafile=_CA_FILE)
         try:
+            context = create_ssl_context()
             with urlopen(url, timeout=self.FETCH_TIMEOUT,
                          context=context) as resp:
                 raw = resp.read()

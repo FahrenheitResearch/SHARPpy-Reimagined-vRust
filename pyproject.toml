@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sharpmod"
 version = "0.2.0"
-description = "A modernized, standalone fork of the SHARPpy sounding renderer (Python 3.11+, NumPy 1.24+, Qt6/PySide6)."
+description = "SHARPpy Reimagined vRust: Rust-accelerated model soundings and analytic ECAPE with a Qt6 SHARPpy-style GUI."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "BSD-3-Clause" }
@@ -50,19 +50,19 @@ dependencies = [
     "certifi>=2023.7.22",
     # SHARPpy's declared runtime need (used by its datasources import chain).
     "requests>=2.28,<3.0",
-    # Reference-consistent ECAPE (Peters et al. 2023) building blocks are
-    # computed via MetPy to agree with the authors' ECAPE_FUNCTIONS oracle
-    # (Requirement 5.7); the ECAPE parameter degrades to MISSING without it.
+    # MetPy supports the cross-platform analytic ECAPE fallback and the wider
+    # derived-parameter calculation stack.
     "metpy>=1.5,<2.0",
-    # Analytic ECAPE implementation (Peters et al.) used by sharptab.ecape.
-    "ecape>=0.1,<1.0",
+    # ecape-parcel-py is the numerical fallback/oracle for the bundled
+    # standalone ecape-rs analytic accelerator.
+    "ecape-parcel>=1.2.2,<2.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/ShianMike/SHARPpy-Reimagined"
-Repository = "https://github.com/ShianMike/SHARPpy-Reimagined"
-Documentation = "https://github.com/ShianMike/SHARPpy-Reimagined/blob/main/docs/USAGE.md"
-Issues = "https://github.com/ShianMike/SHARPpy-Reimagined/issues"
+Homepage = "https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust"
+Repository = "https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust"
+Documentation = "https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust/blob/main/docs/USAGE.md"
+Issues = "https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust/issues"
 
 [project.optional-dependencies]
 # ERA5 / GRIB point-sounding extraction tooling (optional install extra).
@@ -125,7 +125,9 @@ packages = [
 "sharpmod.resources.fonts" = ["*.ttf"]
 # Bundle the full UWyo station catalogue and the GUI basemap coastlines so
 # every station is choosable offline and the picker map renders without network.
-"sharpmod.resources" = ["*.json"]
+# Icons are data files beneath ``sharpmod.resources`` (the icons directory is
+# not itself a Python package), so include the relative subdirectory pattern.
+"sharpmod.resources" = ["*.json", "icons/*", "bin/*"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["*.pyc"]

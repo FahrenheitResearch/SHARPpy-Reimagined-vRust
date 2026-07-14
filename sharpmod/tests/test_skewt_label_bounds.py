@@ -129,13 +129,21 @@ class _TraceWidget:
     sfc_units = "Fahrenheit"
     bg_color = QtGui.QColor("#000000")
     environment_trace_font = QtGui.QFont("Helvetica", 16)
+    temp_color = QtGui.QColor("#ff0000")
+    dewp_color = QtGui.QColor("#00ff00")
+    wetbulb_color = QtGui.QColor("#00ffff")
+
+    def height(self):
+        return 250
 
     def __init__(self):
         self.pres = ma.masked_array([1000.0, 900.0], mask=[False, False])
+        self.tmpc = ma.masked_array([20.0, 15.0], mask=[False, False])
+        self.dwpc = ma.masked_array([5.0, 0.0], mask=[False, False])
 
     def tmpc_to_pix(self, data, _pres):
         values = np.asarray(data, dtype=float)
-        return np.linspace(248.0, 180.0, values.size)
+        return values * 4.0 + 100.0
 
     def pres_to_pix(self, pres):
         values = np.asarray(pres, dtype=float)
@@ -437,7 +445,7 @@ def test_hodograph_ring_labels_use_only_natural_positions_that_fit(qt_app):
     assert labels[0].rect.center().x() > widget.centerx
 
 
-def test_surface_trace_label_clamps_right_and_flips_above_bottom(qt_app):
+def test_surface_trace_label_clamps_right_and_stays_below_trace(qt_app):
     render_mod._install_skewt_sfc_label_mask()
 
     from sharppy.viz.skew import plotSkewT
@@ -450,8 +458,42 @@ def test_surface_trace_label_clamps_right_and_flips_above_bottom(qt_app):
 
     text_rect, text = painter.texts[-1]
     assert text == "92"
-    _assert_inside_plot(widget, text_rect)
-    assert text_rect.bottom() < widget.bry
+    assert text_rect.left() >= widget.lpad + 2
+    assert text_rect.right() <= widget.brx - 2
+    assert text_rect.top() > widget.bry
+    assert text_rect.bottom() <= widget.height() - 2
+
+
+def test_surface_trace_labels_bias_away_from_each_other():
+    widget = _TraceWidget()
+    dew = render_mod._skewt_surface_label_rect(
+        widget, QtCore, 120, 220, 20, 14, anchor="right")
+    temp = render_mod._skewt_surface_label_rect(
+        widget, QtCore, 130, 220, 20, 14, anchor="left")
+
+    assert dew.right() == pytest.approx(120)
+    assert temp.left() == pytest.approx(130)
+    assert dew.top() > 220
+    assert temp.top() > 220
+    assert dew.right() < temp.left()
+
+
+def test_wetbulb_surface_label_fits_between_dewpoint_and_temperature(qt_app):
+    render_mod._install_skewt_sfc_label_mask()
+
+    from sharppy.viz.skew import plotSkewT
+
+    widget = _TraceWidget()
+    painter = _RecordingPainter()
+    wetbulb = ma.masked_array([12.0, 8.0], mask=[False, False])
+    plotSkewT.drawTrace(widget, wetbulb, widget.wetbulb_color, painter)
+
+    rect, _text = painter.texts[-1]
+    dew_x = widget.tmpc_to_pix(widget.dwpc[0], widget.pres[0])
+    temp_x = widget.tmpc_to_pix(widget.tmpc[0], widget.pres[0])
+    assert rect.left() >= dew_x + 4
+    assert rect.right() <= temp_x - 4
+    assert rect.top() > widget.bry
 
 
 def test_effective_layer_sfc_label_clamps_left_and_flips_above_bottom(

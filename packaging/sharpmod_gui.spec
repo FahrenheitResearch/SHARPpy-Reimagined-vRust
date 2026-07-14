@@ -6,7 +6,7 @@ Builds a single windowed executable (no console) that bundles:
 * the ``sharpmod`` package (with its TTF fonts + UWyo station catalogue),
 * the vendored upstream ``sharppy`` render stack (with its ``databases`` +
   ``datasources`` data files and all decoder submodules),
-* the scientific runtime (``metpy``/``pint``/``ecape``/``scipy``) that the
+* the scientific runtime (``metpy``/``pint``/``ecape_parcel``/``scipy``) that the
   derived-parameter layer needs at runtime,
 * the live model-fetch runtime (``herbie``/``cfgrib``/``eccodes``/``xarray``),
   including ecCodes' Windows DLL and Herbie's model templates.
@@ -15,9 +15,9 @@ Build from the repository root with::
 
     pyinstaller packaging/sharpmod_gui.spec --noconfirm
 
-The result is ``dist/SHARPpy-Reimagined/SHARPpy-Reimagined.exe`` (one-folder
+The result is ``dist/SHARPpy-Reimagined-vRust/SHARPpy-Reimagined-vRust.exe`` (one-folder
 build -- fast start-up and easiest to debug). Flip ``ONEFILE = True`` below for
-a single self-extracting ``dist/SHARPpy-Reimagined.exe`` instead.
+a single self-extracting ``dist/SHARPpy-Reimagined-vRust.exe`` instead.
 """
 
 import glob
@@ -33,6 +33,7 @@ from PyInstaller.utils.hooks import (
 # Overridable from the environment so we can build either layout without editing
 # the spec:  set SHARPMOD_ONEFILE=1 for a single self-extracting .exe.
 ONEFILE = os.environ.get("SHARPMOD_ONEFILE", "0") == "1"
+APP_NAME = "SHARPpy-Reimagined-vRust"
 
 datas = []
 binaries = []
@@ -56,13 +57,15 @@ for _json in glob.glob(os.path.join(_RES, "*.json")):
     datas.append((_json, "sharpmod/resources"))
 for _ttf in glob.glob(os.path.join(_RES, "fonts", "*.ttf")):
     datas.append((_ttf, "sharpmod/resources/fonts"))
+for _native in glob.glob(os.path.join(_RES, "bin", "*")):
+    datas.append((_native, "sharpmod/resources/bin"))
 
 # Collect the fork, the vendored render stack, and the scientific runtime in
 # full (data files + submodules + any bundled binaries). ``collect_all`` is the
 # robust way to pull package data (fonts, station JSON, sharppy databases,
 # metpy/pint unit + static data) that would otherwise be missed by a frozen app.
 for pkg in (
-    "sharpmod", "sharppy", "sutils", "metpy", "pint", "ecape",
+    "sharpmod", "sharppy", "sutils", "metpy", "pint", "ecape_parcel",
     "cfgrib", "eccodes",
 ):
     try:
@@ -158,7 +161,7 @@ if ONEFILE:
         a.zipfiles,
         a.datas,
         [],
-        name="SHARPpy-Reimagined",
+        name=APP_NAME,
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -179,7 +182,7 @@ else:
         a.scripts,
         [],
         exclude_binaries=True,
-        name="SHARPpy-Reimagined",
+        name=APP_NAME,
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -200,5 +203,5 @@ else:
         strip=False,
         upx=True,
         upx_exclude=[],
-        name="SHARPpy-Reimagined",
+        name=APP_NAME,
     )

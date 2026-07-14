@@ -27,20 +27,15 @@ import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 
 # --- Qt platform / binding setup (MUST precede the first Qt import) ---------
-# The renderer defaults ``QT_QPA_PLATFORM`` to "offscreen" via ``setdefault``.
-# For an interactive app we want the native windowing platform, so pin it here
-# BEFORE importing :mod:`sharpmod.render` (whose ``setdefault`` then no-ops).
-# Respect an explicit override so power users and headless tests can still
-# force e.g. ``offscreen`` or ``xcb``.
-if "QT_QPA_PLATFORM" not in os.environ:
-    os.environ["QT_QPA_PLATFORM"] = (
-        "windows" if sys.platform.startswith("win")
-        else ("cocoa" if sys.platform == "darwin" else "xcb")
-    )
-os.environ.setdefault("QT_API", "pyside6")
+# Leave ``QT_QPA_PLATFORM`` unset for interactive use so Qt can select the
+# native Windows, Cocoa, Wayland, or X11 plugin.  Explicit user/test overrides
+# (for example ``offscreen``) remain honored.  Pin qtpy to the only binding the
+# application installs and whose classes the compatibility layer patches.
+os.environ["QT_API"] = "pyside6"
 
 from qtpy.QtCore import (  # noqa: E402
     Qt, QThread, QTimer, Signal, QDate, QSettings, QPointF, QRectF, QSize,
@@ -76,6 +71,7 @@ from qtpy.QtWidgets import (  # noqa: E402
     QDialogButtonBox,
     QFormLayout,
     QCheckBox,
+    QProgressBar,
     QSizePolicy,
     QGraphicsView,
     QGraphicsScene,
@@ -88,8 +84,8 @@ _compose_window_fn = None
 _uwyo_catalog_mod = None
 _uwyo_decoder_types = None
 
-APP_NAME = "SHARPpy Reimagined"
-APP_VERSION = "0.2 (20260713)"
+APP_NAME = "SHARPpy Reimagined vRust"
+APP_VERSION = "0.2.0"
 
 UNIT_DEFAULTS = {
     "temp_units": "Fahrenheit",
@@ -267,6 +263,10 @@ SYNOPTIC_HOURS = (0, 6, 12, 18)
 
 #: How many recent files / stations to remember.
 MAX_RECENTS = 8
+SOUNDING_FILE_FILTER = (
+    "Soundings (*.npz *.spc *.SPC *.oax *.OAX *.txt *.buf);;"
+    "All files (*.*)"
+)
 
 # Guard so the one-time vendored-widget monkeypatches are installed once.
 _setup_done = False
@@ -374,7 +374,13 @@ def _ensure_setup(app) -> None:
     # Size the skew-T mixing-ratio + surface-value label masks to the font so
     # background lines stop bleeding through the (wider-font) digits.
     R._install_skewt_mixratio_mask()
+    # Keep the live GUI on the exact same surface-label path as the PNG
+    # renderer.  Without these two patches the interactive window retained
+    # upstream's too-shallow 1050-hPa lower margin and painted the labels
+    # before later traces, even though headless render tests looked correct.
+    R._install_skewt_surface_padding()
     R._install_skewt_sfc_label_mask()
+    R._install_skewt_surface_label_overlay()
     R._install_skewt_effective_layer_label_fit()
     # Redraw the white skew-T outline on top so label masks never gap it.
     R._install_skewt_frame_ontop()
@@ -445,16 +451,13 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     # mount=True appends the derived-parameter family panels into the vendored
     # index band and attaches the skew-T HGZ overlay; controller=picker wires
     # the config/preferences/focus contract to the picker window.
-    win, _ = _compose_window()(config, prof_col, mount=True, controller=controller)
+    win, _ = _compose_window()(
+        config, prof_col, mount=True, controller=controller,
+        defer_show=True)
 
-    # The vendored SPCWindow.__initUI calls self.show() as soon as it is
-    # constructed, so an empty white window flashes on screen while we still
-    # have to add the profile metadata, run layout compensation, grow the
-    # canvas, and embed it in the scaling graphics view. Hide it now and only
-    # reveal it once fully composed + painted (see the showNormal() at the end),
-    # so the user sees the finished sounding appear in one step -- no white
-    # flash, no half-built window.
-    win.hide()
+    # ``defer_show=True`` realizes the vendored layout with Qt's
+    # WA_DontShowOnScreen flag, then hides it. Geometry is fully available for
+    # sizing, but Windows never receives a blank surface to flash.
 
     # Rebrand the vendored window title + top-right version label.
     try:
@@ -1599,11 +1602,12 @@ class _AvailabilityIndicator(QWidget):
 class _FetchWorker(QThread):
     """Fetch a UWyo sounding off the UI thread and write a temp ``.npz``.
 
-    Emits :attr:`finished_ok` with ``(npz_path, station_meta, when)`` on
-    success or :attr:`failed` with a human-readable message on any error.
+    Emits :attr:`finished_ok` with the temporary path, station/time metadata,
+    and prepared profile collection on success, or :attr:`failed` with a
+    human-readable message on any error.
     """
 
-    finished_ok = Signal(str, object, object)
+    finished_ok = Signal(str, object, object, object, str)
     failed = Signal(str)
 
     def __init__(self, station_query: str, when_utc: datetime, parent=None,
@@ -1650,17 +1654,35 @@ class _FetchWorker(QThread):
                 prefix=f"uwyo_{meta.id}_{self._when:%Y%m%d%H}_", suffix=".npz")
             os.close(fd)
             _write_npz(prof, npz_path, prof_meta, loc)
+            # Decode and warm the displayed derived values here, while still
+            # off the Qt UI thread.  In particular this absorbs MetPy's cold
+            # import and the analytic ECAPE solve before the plot is shown.
+            from sharpmod.io.decoder import load_npz
+            prof_col, stn_id = load_npz(npz_path)
+            _prepare_display_profile(prof_col)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"Could not save fetched sounding: {exc}")
             return
 
-        self.finished_ok.emit(npz_path, meta, self._when)
+        self.finished_ok.emit(npz_path, meta, self._when, prof_col, stn_id)
 
 
 def _cleanup_model_data(npz_path: str, download_dir: str) -> None:
     """Remove one isolated forecast-model fetch tree."""
     from sharpmod.tools import model_extract
     model_extract.cleanup_transient_data(npz_path, download_dir)
+
+
+def _prepare_display_profile(prof_col):
+    """Compute the IndexBoard's lazy values on the current worker thread."""
+    from sharpmod.sharptab.profile import (
+        DISPLAY_DERIVED_ATTRS,
+        derived_profile_from,
+    )
+
+    prof = prof_col.getHighlightedProf()
+    derived = derived_profile_from(prof, warm=DISPLAY_DERIVED_ATTRS)
+    return prof, derived
 
 
 def _retain_model_data_until_close(viewer, npz_path: str,
@@ -1674,7 +1696,8 @@ def _retain_model_data_until_close(viewer, npz_path: str,
 class _ModelFetchWorker(QThread):
     """Extract a forecast-model point sounding off the UI thread."""
 
-    finished_ok = Signal(str, str, object, int)
+    finished_ok = Signal(str, str, object, int, object, str)
+    progress = Signal(str, int)
     failed = Signal(str)
 
     def __init__(self, model: str, lat: float, lon: float, run_time: datetime,
@@ -1696,7 +1719,8 @@ class _ModelFetchWorker(QThread):
         try:
             from sharpmod.tools import model_extract
             cfg = model_extract.get_config(self._model)
-            path = model_extract.extract(
+            self.progress.emit("Resolving model cycle and cache", 3)
+            path, resolved_run = model_extract.extract_with_cycle_fallback(
                 self._model,
                 self._lat,
                 self._lon,
@@ -1706,12 +1730,41 @@ class _ModelFetchWorker(QThread):
                 loc=self._loc,
                 member=self._member,
                 download_dir=self._download_dir,
+                progress=self.progress.emit,
             )
+            self.progress.emit("Calculating sounding parameters", 88)
+            from sharpmod.io.decoder import load_npz
+            prof_col, stn_id = load_npz(path)
+            # Force the expensive raw -> ConvectiveProfile upgrade here,
+            # outside the Qt event thread.
+            _prepare_display_profile(prof_col)
+            self.progress.emit("Sounding ready; building interactive plot", 96)
         except Exception as exc:  # noqa: BLE001 - surface any model error to UI
             _cleanup_model_data(self._out_path, self._download_dir)
             self.failed.emit(f"Forecast model fetch failed: {exc}")
             return
-        self.finished_ok.emit(path, cfg.label, self._run_time, self._fxx)
+        self.finished_ok.emit(
+            path, cfg.label, resolved_run, self._fxx, prof_col, stn_id)
+
+
+class _FilePrepareWorker(QThread):
+    """Decode and warm a local sounding without blocking Qt's UI thread."""
+
+    finished_ok = Signal(str, object, str)
+    failed = Signal(str, str)
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self._path = path
+
+    def run(self):  # noqa: D401 - QThread entry point
+        try:
+            prof_col, stn_id = _render().decode(self._path)
+            _prepare_display_profile(prof_col)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self._path, str(exc))
+            return
+        self.finished_ok.emit(self._path, prof_col, stn_id)
 
 
 # ===========================================================================
@@ -2315,6 +2368,19 @@ class PickerWindow(QMainWindow):
         self._viewers: list = []
         self._worker: _FetchWorker | None = None
         self._model_worker: _ModelFetchWorker | None = None
+        self._file_worker: _FilePrepareWorker | None = None
+        self._model_viewer = None
+        self._model_viewer_menu = None
+        self._model_progress_stage = ""
+        self._model_progress_started = None
+        self._model_progress_timer = QTimer(self)
+        self._model_progress_timer.setInterval(1000)
+        self._model_progress_timer.timeout.connect(
+            self._refresh_model_progress_text)
+        self._model_click_timer = QTimer(self)
+        self._model_click_timer.setSingleShot(True)
+        self._model_click_timer.setInterval(300)
+        self._model_click_timer.timeout.connect(self._model_fetch)
         self._settings = QSettings("SHARPpyReimagined", "GUI")
         self._all_stations = _uwyo_catalog().all_stations()
 
@@ -2358,7 +2424,8 @@ class PickerWindow(QMainWindow):
         self._tabs.addTab(self._build_map_tab(), "Station Map")
         self._tabs.addTab(self._build_uwyo_tab(), "Station List")
         self._tabs.addTab(self._build_model_tab(), "Forecast Model")
-        self._tabs.addTab(self._build_file_tab(), "Open File")
+        self._file_tab = self._build_file_tab()
+        self._tabs.addTab(self._file_tab, "Open File")
         self._tabs.currentChanged.connect(self._sync_tab_status)
         self.setCentralWidget(self._tabs)
 
@@ -3026,8 +3093,17 @@ class PickerWindow(QMainWindow):
                                     station=self._station(sid))
         self._worker.finished_ok.connect(self._on_fetch_ok)
         self._worker.failed.connect(self._on_fetch_failed)
-        self._worker.finished.connect(lambda: self._set_busy(False))
+        self._worker.finished.connect(self._on_fetch_worker_finished)
         self._worker.start()
+
+    def _on_fetch_worker_finished(self) -> None:
+        """Release a completed UWyo worker before another fetch starts."""
+        worker = self.sender()
+        if worker is self._worker:
+            self._worker = None
+        self._set_busy(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def _set_busy(self, busy: bool) -> None:
         if busy:
@@ -3045,15 +3121,13 @@ class PickerWindow(QMainWindow):
                 self._map_gen_btn.setText("Generate Sounding")
                 self._map_gen_btn.setEnabled(bool(self._map_selected_id))
 
-    def _on_fetch_ok(self, npz_path, meta, when) -> None:
+    def _on_fetch_ok(self, npz_path, meta, when, prof_col, stn_id) -> None:
         self.statusBar().showMessage(
             f"Rendering {meta.id} sounding\u2026 (this takes a moment)")
         # Force the status message to paint before the synchronous compose
         # (which briefly blocks the UI thread while the SPC window is built).
         QApplication.processEvents()
         try:
-            R = _render()
-            prof_col, stn_id = R.decode(npz_path)
             title = f"{APP_NAME} \u2014 {meta.id} {when:%Y-%m-%d %H}Z"
             self._show_sounding(prof_col, stn_id, title=title)
             self.statusBar().showMessage(f"Opened {meta.id} {when:%Y-%m-%d %H}Z")
@@ -3082,8 +3156,7 @@ class PickerWindow(QMainWindow):
         self._model_syncing_point = False
         self._model_map = PointMapWidget()
         self._model_map.pointSelected.connect(self._model_on_map_point)
-        self._model_map.pointActivated.connect(
-            lambda _lat, _lon: self._model_fetch())
+        self._model_map.pointActivated.connect(self._model_activate_point)
 
         left = QVBoxLayout()
         left.setSpacing(8)
@@ -3125,7 +3198,11 @@ class PickerWindow(QMainWindow):
         left.addWidget(model_box)
 
         time_box = QGroupBox("Run / valid time (UTC)")
-        time_box.setMinimumHeight(150)
+        self._model_time_box = time_box
+        # Four rows live in this group (date, cycle, forecast, and the
+        # run-to-valid summary).  A 150 px minimum let Qt squeeze the summary
+        # underneath the Forecast row on Windows at 100% display scaling.
+        time_box.setMinimumHeight(184)
         time_grid = QGridLayout(time_box)
         time_grid.setVerticalSpacing(8)
         time_grid.setColumnStretch(1, 1)
@@ -3163,10 +3240,13 @@ class PickerWindow(QMainWindow):
         time_grid.addWidget(self._model_fxx_combo, 2, 1, 1, 2)
         self._model_valid_lbl = QLabel("")
         self._model_valid_lbl.setStyleSheet("font-weight: bold;")
+        self._model_valid_lbl.setWordWrap(True)
+        self._model_valid_lbl.setMinimumHeight(34)
         time_grid.addWidget(self._model_valid_lbl, 3, 0, 1, 3)
         left.addWidget(time_box)
 
         point_box = QGroupBox("Point")
+        self._model_point_box = point_box
         point_grid = QGridLayout(point_box)
         point_grid.setColumnStretch(1, 1)
         point_grid.addWidget(QLabel("Latitude:"), 0, 0)
@@ -3199,6 +3279,7 @@ class PickerWindow(QMainWindow):
         left.addWidget(point_box)
 
         member_box = QGroupBox("Member")
+        self._model_member_box = member_box
         member_layout = QVBoxLayout(member_box)
         self._model_member = QLineEdit()
         member_layout.addWidget(self._model_member)
@@ -3208,6 +3289,17 @@ class PickerWindow(QMainWindow):
         self._model_fetch_btn.setMinimumHeight(36)
         self._model_fetch_btn.clicked.connect(self._model_fetch)
         left.addWidget(self._model_fetch_btn)
+
+        self._model_progress = QProgressBar()
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setTextVisible(True)
+        self._model_progress.hide()
+        left.addWidget(self._model_progress)
+        self._model_progress_lbl = QLabel("")
+        self._model_progress_lbl.setWordWrap(True)
+        self._model_progress_lbl.setStyleSheet("color: #9fb2c9;")
+        self._model_progress_lbl.hide()
+        left.addWidget(self._model_progress_lbl)
 
         unsupported = QLabel(self._model_unsupported_text())
         unsupported.setWordWrap(True)
@@ -3219,8 +3311,21 @@ class PickerWindow(QMainWindow):
         left_w.setLayout(left)
         left_w.setMinimumWidth(PICKER_RAIL_MIN_WIDTH)
         left_w.setMaximumWidth(PICKER_RAIL_MAX_WIDTH)
-        left_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        outer.addWidget(left_w)
+        # The ensemble-member controls and wrapped provider notes make this
+        # rail taller than a 720 px desktop window. Let it retain natural
+        # group-box heights and scroll instead of allowing QVBoxLayout to
+        # compress the Forecast row into the Point header.
+        left_w.setMinimumHeight(710)
+        left_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        rail_scroll = QScrollArea()
+        rail_scroll.setWidgetResizable(True)
+        rail_scroll.setFrameShape(QFrame.NoFrame)
+        rail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        rail_scroll.setWidget(left_w)
+        rail_scroll.setMinimumWidth(PICKER_RAIL_MIN_WIDTH + 12)
+        rail_scroll.setMaximumWidth(PICKER_RAIL_MAX_WIDTH + 12)
+        self._model_rail_scroll = rail_scroll
+        outer.addWidget(rail_scroll)
         outer.addWidget(self._model_map, stretch=1)
 
         self._model_area_changed(self._model_area_combo.currentText())
@@ -3296,6 +3401,8 @@ class PickerWindow(QMainWindow):
         self._model_cycle.clear()
         if cfg is None:
             self._model_notes.setText("")
+            if hasattr(self, "_model_member_box"):
+                self._model_member_box.hide()
             self._model_cycle.blockSignals(False)
             self._model_update_fxx()
             self._model_update_fetch_state()
@@ -3317,6 +3424,7 @@ class PickerWindow(QMainWindow):
                 cfg.domain_bounds, f"{cfg.label} domain: {cfg.domain}")
         ensemble = cfg.key in {"gefs", "cfs"}
         self._model_member.setEnabled(ensemble)
+        self._model_member_box.setVisible(ensemble)
         if ensemble:
             if cfg.key == "gefs":
                 self._model_member.setPlaceholderText("default c00; e.g. p01")
@@ -3398,6 +3506,26 @@ class PickerWindow(QMainWindow):
         finally:
             self._model_syncing_point = False
         self._model_update_fetch_state()
+        # Once a model plot exists, a single click refreshes that same window.
+        # Debounce clicks so double-click and rapid corrections cannot queue
+        # overlapping model requests.
+        if self._model_viewer_is_open() and not (
+                self._model_worker is not None
+                and self._model_worker.isRunning()):
+            self._model_click_timer.start()
+
+    def _model_activate_point(self, _lat: float, _lon: float) -> None:
+        self._model_click_timer.stop()
+        self._model_fetch()
+
+    def _model_viewer_is_open(self) -> bool:
+        try:
+            return self._model_viewer is not None \
+                and self._model_viewer.isVisible()
+        except RuntimeError:
+            self._model_viewer = None
+            self._model_viewer_menu = None
+            return False
 
     def _model_point_ok(self) -> bool:
         cfg = self._model_config()
@@ -3450,7 +3578,7 @@ class PickerWindow(QMainWindow):
         run_time = self._model_run_time()
         member = self._model_member.text().strip() or None \
             if self._model_member.isEnabled() else None
-        loc = f"{cfg.label} {lat:.2f}, {lon:.2f}"
+        loc = f"{cfg.label} {lat:.4f}, {lon:.4f}"
 
         download_dir = tempfile.mkdtemp(
             prefix=f"model_{cfg.key.replace('-', '_')}_{run_time:%Y%m%d%H}_"
@@ -3464,31 +3592,78 @@ class PickerWindow(QMainWindow):
             cfg.key, lat, lon, run_time, fxx, npz_path, loc=loc,
             member=member, download_dir=download_dir, parent=self)
         self._model_worker.finished_ok.connect(self._on_model_fetch_ok)
+        self._model_worker.progress.connect(self._on_model_progress)
         self._model_worker.failed.connect(self._on_model_fetch_failed)
-        self._model_worker.finished.connect(lambda: self._set_model_busy(False))
-        self._model_worker.finished.connect(self._model_worker.deleteLater)
+        self._model_worker.finished.connect(self._on_model_worker_finished)
         self._model_worker.start()
+
+    def _on_model_worker_finished(self) -> None:
+        """Clear the Qt wrapper before scheduling a finished worker's deletion."""
+        worker = self.sender()
+        if worker is self._model_worker:
+            self._model_worker = None
+        self._set_model_busy(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def _set_model_busy(self, busy: bool) -> None:
         if busy:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
             self._model_fetch_btn.setEnabled(False)
+            self._model_progress_started = time.monotonic()
+            self._model_progress_stage = "Starting model fetch"
+            self._model_progress.setValue(1)
+            self._model_progress.show()
+            self._model_progress_lbl.show()
+            self._model_progress_timer.start()
+            self._refresh_model_progress_text()
             self._model_fetch_btn.setText("Fetching\u2026")
         else:
-            QApplication.restoreOverrideCursor()
+            self._model_progress_timer.stop()
+            self._model_progress.hide()
+            self._model_progress_lbl.hide()
+            self._model_progress_started = None
             self._model_fetch_btn.setText("Fetch && Display Forecast Sounding")
             self._model_update_fetch_state()
 
-    def _on_model_fetch_ok(self, npz_path, label, run_time, fxx) -> None:
+    def _on_model_progress(self, message: str, percent: int) -> None:
+        self._model_progress_stage = message
+        self._model_progress.setValue(max(0, min(100, int(percent))))
+        self._refresh_model_progress_text()
+        self.statusBar().showMessage(message)
+
+    def _refresh_model_progress_text(self) -> None:
+        if self._model_progress_started is None:
+            return
+        elapsed = max(0, int(time.monotonic() - self._model_progress_started))
+        self._model_progress_lbl.setText(
+            f"{self._model_progress_stage}  ·  {elapsed}s elapsed\n"
+            "The picker remains usable while this runs.")
+
+    def _on_model_fetch_ok(self, npz_path, label, run_time, fxx,
+                           prof_col, stn_id) -> None:
         self.statusBar().showMessage(f"Rendering {label} F{int(fxx):03d}\u2026")
         QApplication.processEvents()
         try:
-            R = _render()
-            prof_col, stn_id = R.decode(npz_path)
             title = (
                 f"{APP_NAME} \u2014 {label} "
                 f"{run_time:%Y-%m-%d %H}Z F{int(fxx):03d}")
-            win = self._show_sounding(prof_col, stn_id, title=title)
+            if self._model_viewer_is_open():
+                win = self._model_viewer
+                old_menu = self._model_viewer_menu
+                win.addProfileCollection(
+                    prof_col, focus=True, check_integrity=False)
+                new_menu = win.createMenuName(prof_col)
+                if old_menu and old_menu != new_menu:
+                    win.rmProfileCollection(old_menu)
+                self._refresh_mounted_model_products(win, prof_col)
+                win.setWindowTitle(title)
+                win.showNormal()
+                win.raise_()
+                win.activateWindow()
+            else:
+                win = self._show_sounding(prof_col, stn_id, title=title)
+            self._model_viewer = win
+            self._model_viewer_menu = win.createMenuName(prof_col)
             _retain_model_data_until_close(
                 win, npz_path, os.path.dirname(npz_path))
             self.statusBar().showMessage(
@@ -3497,6 +3672,22 @@ class PickerWindow(QMainWindow):
             _cleanup_model_data(npz_path, os.path.dirname(npz_path))
             QMessageBox.critical(self, APP_NAME,
                                  f"Fetched, but could not display:\n{exc}")
+
+    @staticmethod
+    def _refresh_mounted_model_products(win, prof_col) -> None:
+        prof, derived = _prepare_display_profile(prof_col)
+        products = getattr(win, "sharpmod_products", None)
+        if products is None:
+            return
+        board = getattr(products, "composite", None)
+        set_data = getattr(board, "setData", None)
+        if callable(set_data):
+            set_data(prof, derived)
+        for name in ("thermo", "kinematic", "streamwiseness"):
+            widget = getattr(products, name, None)
+            setter = getattr(widget, "setProf", None)
+            if callable(setter):
+                setter(prof)
 
     def _on_model_fetch_failed(self, message: str) -> None:
         self.statusBar().showMessage("Forecast model fetch failed")
@@ -3528,10 +3719,10 @@ class PickerWindow(QMainWindow):
         row.addWidget(browse)
         layout.addLayout(row)
 
-        open_btn = QPushButton("Open Sounding")
-        open_btn.setMinimumHeight(32)
-        open_btn.clicked.connect(self._open_from_edit)
-        layout.addWidget(open_btn)
+        self._file_open_btn = QPushButton("Open Sounding")
+        self._file_open_btn.setMinimumHeight(32)
+        self._file_open_btn.clicked.connect(self._open_from_edit)
+        layout.addWidget(self._file_open_btn)
 
         recent_box = QGroupBox("Recent files")
         rv = QVBoxLayout(recent_box)
@@ -3546,7 +3737,7 @@ class PickerWindow(QMainWindow):
         start = self._settings.value("last_dir", "", str)
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Sounding File", start,
-            "Soundings (*.npz *.txt *.buf);;All files (*.*)")
+            SOUNDING_FILE_FILTER)
         if path:
             self._file_edit.setText(path)
             self._open_file(path)
@@ -3565,28 +3756,48 @@ class PickerWindow(QMainWindow):
         if not path or not os.path.exists(path):
             QMessageBox.warning(self, APP_NAME, f"File not found:\n{path}")
             return
-        self.statusBar().showMessage(f"Decoding {os.path.basename(path)}\u2026")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            QApplication.processEvents()
-            R = _render()
-            prof_col, stn_id = R.decode(path)
-        except Exception as exc:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
-            self.statusBar().showMessage("Decode failed")
-            QMessageBox.critical(
-                self, APP_NAME,
-                f"Could not decode this file:\n{path}\n\n{exc}")
+        if self._file_worker is not None and self._file_worker.isRunning():
+            QMessageBox.information(self, APP_NAME,
+                                    "A local sounding is already loading.")
             return
+        self.statusBar().showMessage(
+            f"Decoding and calculating {os.path.basename(path)} in background\u2026")
+        self._file_open_btn.setEnabled(False)
+        self._file_open_btn.setText("Preparing sounding\u2026")
+        self._file_worker = _FilePrepareWorker(path, parent=self)
+        self._file_worker.finished_ok.connect(self._on_file_prepare_ok)
+        self._file_worker.failed.connect(self._on_file_prepare_failed)
+        self._file_worker.finished.connect(self._on_file_worker_finished)
+        self._file_worker.start()
+
+    def _on_file_prepare_ok(self, path, prof_col, stn_id) -> None:
         try:
             self._show_sounding(
                 prof_col, stn_id,
                 title=f"{APP_NAME} \u2014 {os.path.basename(path)}")
             self._settings.setValue("last_dir", os.path.dirname(path))
             self._remember_recent_file(path)
-        finally:
-            QApplication.restoreOverrideCursor()
-        self.statusBar().showMessage(f"Opened {os.path.basename(path)}")
+            self.statusBar().showMessage(f"Opened {os.path.basename(path)}")
+        except Exception as exc:  # noqa: BLE001
+            self.statusBar().showMessage("Display failed")
+            QMessageBox.critical(
+                self, APP_NAME,
+                f"Prepared, but could not display this file:\n{path}\n\n{exc}")
+
+    def _on_file_prepare_failed(self, path: str, message: str) -> None:
+        self.statusBar().showMessage("Decode failed")
+        QMessageBox.critical(
+            self, APP_NAME,
+            f"Could not decode this file:\n{path}\n\n{message}")
+
+    def _on_file_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker is self._file_worker:
+            self._file_worker = None
+        self._file_open_btn.setEnabled(True)
+        self._file_open_btn.setText("Open Sounding")
+        if worker is not None:
+            worker.deleteLater()
 
     # -- recents ------------------------------------------------------------- #
     def _remember_recent_file(self, path: str) -> None:
@@ -3626,7 +3837,7 @@ class PickerWindow(QMainWindow):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path:
-                self._tabs.setCurrentIndex(1)  # show the Open File tab
+                self._tabs.setCurrentWidget(self._file_tab)
                 self._file_edit.setText(path)
                 self._open_file(path)
                 break

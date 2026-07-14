@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import ssl
 import sys
 import tempfile
 import warnings
@@ -78,7 +77,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # Pin the qtpy binding to PySide6 (Qt6); no PySide2/Qt5 fallback.
 os.environ.setdefault("QT_API", "pyside6")
 
-import certifi  # noqa: E402
+from sharpmod.io.tls import create_ssl_context  # noqa: E402
 from urllib.error import URLError  # noqa: E402
 from urllib.request import urlopen  # noqa: E402
 
@@ -276,7 +275,7 @@ SKEWT_LPAD = int(os.environ.get("SKEWT_LPAD", "46"))
 # clear that border (a lower value clipped the title's descenders against it)
 # while still lining up with the top-right brand label (see BRAND_PAD_*). This
 # value keeps a small gap between the title and the border.
-TITLE_TOP = int(os.environ.get("TITLE_TOP", "0"))
+TITLE_TOP = int(os.environ.get("TITLE_TOP", "3"))
 TITLE_STRETCH = int(os.environ.get("TITLE_STRETCH", "80"))
 # Vertical padding (px) for the top-right brand label. The vendored SPCWidget
 # stacks this label in its own header row above the upper-right panel column,
@@ -746,6 +745,44 @@ def _install_skewt_sfc_label_mask():
                     # close together; at the tall bundled font (~15 pt) their
                     # masks overlap and a later label erases its neighbor. Cap
                     # the point size so all three fit side-by-side.
+                    label_anchor = "center"
+                    trace_kind = "other"
+                    wet_bounds = None
+                    try:
+                        trace_color = _QtGui.QColor(color)
+                        if trace_color == _QtGui.QColor(self.dewp_color):
+                            trace_kind = "dewpoint"
+                            # Put the entire dewpoint value left of its trace.
+                            label_anchor = "right"
+                        elif trace_color == _QtGui.QColor(self.temp_color):
+                            trace_kind = "temperature"
+                            # Put the entire temperature value right of its
+                            # trace.  This prevents close T/Td values from
+                            # painting on top of each other.
+                            label_anchor = "left"
+                        elif trace_color == _QtGui.QColor(self.wetbulb_color):
+                            trace_kind = "wetbulb"
+                            surface_pres = self.pres[0]
+                            dew_value = self.dwpc[0]
+                            temp_value = self.tmpc[0]
+                            if (_np.ma.is_masked(surface_pres)
+                                    or _np.ma.is_masked(dew_value)
+                                    or _np.ma.is_masked(temp_value)):
+                                raise ValueError("masked surface trace")
+                            dew_x = self.originx + self.tmpc_to_pix(
+                                dew_value, surface_pres) / self.scale
+                            temp_x = self.originx + self.tmpc_to_pix(
+                                temp_value, surface_pres) / self.scale
+                            if not (_np.isfinite(dew_x) and
+                                    _np.isfinite(temp_x)):
+                                raise ValueError("non-finite surface trace")
+                            wet_bounds = (
+                                min(float(dew_x), float(temp_x)) + 4.0,
+                                max(float(dew_x), float(temp_x)) - 4.0,
+                            )
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+
                     tf = _QtGui.QFont(self.environment_trace_font)
                     if cap > 0 and tf.pointSize() > cap:
                         tf.setPointSize(cap)
@@ -755,9 +792,35 @@ def _install_skewt_sfc_label_mask():
                     th = fm.height()
                     pad_x = 1
                     pad_y = 1
+                    # Wet-bulb sits between T and Td. Reduce only that label
+                    # until it fits the real gap with four pixels of breathing
+                    # room on either side. If the traces are essentially
+                    # coincident, omit the redundant wet-bulb number rather
+                    # than overpainting T or Td.
+                    if trace_kind == "wetbulb" and wet_bounds is not None:
+                        available = wet_bounds[1] - wet_bounds[0]
+                        pt = tf.pointSize()
+                        while tw + 2 * pad_x > available and pt > 7:
+                            pt -= 1
+                            tf.setPointSize(pt)
+                            qp.setFont(tf)
+                            fm = _QtGui.QFontMetrics(tf)
+                            tw = fm.horizontalAdvance(lbl_str)
+                            th = fm.height()
+                        if tw + 2 * pad_x > available:
+                            qp.setClipping(True)
+                            return
                     rect = _skewt_surface_label_rect(
                         self, _QtCore, x[0], y[0],
-                        tw + 2 * pad_x, th + 2 * pad_y)
+                        tw + 2 * pad_x, th + 2 * pad_y,
+                        anchor=label_anchor)
+                    if trace_kind == "wetbulb" and wet_bounds is not None:
+                        wet_left, wet_right = wet_bounds
+                        fitted_left = min(
+                            max(float(rect.x()), wet_left),
+                            wet_right - float(rect.width()),
+                        )
+                        rect.moveLeft(fitted_left)
                     qp.setPen(_QtGui.QPen(self.bg_color, 0,
                                           _QtCore.Qt.SolidLine))
                     qp.setBrush(_QtGui.QBrush(self.bg_color,
@@ -773,6 +836,92 @@ def _install_skewt_sfc_label_mask():
 
         _cls.drawTrace = drawTrace
         _cls._sharpmod_sfc_mask = True
+    except Exception:  # pragma: no cover - vendored module always present
+        pass
+
+
+def _install_skewt_surface_padding():
+    """Reserve enough pressure space below 1000 hPa for surface labels."""
+    try:
+        import sharppy.viz.skew as _skew
+        _cls = _skew.plotSkewT
+        if getattr(_cls, "_sharpmod_surface_padding", False):
+            return
+        _orig_init = _cls.initUI
+        _np = _skew.np
+
+        def initUI(self):
+            _orig_init(self)
+            # Upstream pmax=1050 leaves roughly 14 px below the 1000-hPa
+            # surface on this canvas. A 12-point value needs about 20 px.
+            # Extending only the empty lower pressure margin preserves every
+            # atmospheric level while giving T/Tw/Td a dedicated label lane.
+            if float(getattr(self, "pmax", 1050.0)) < 1100.0:
+                self.pmax = 1100.0
+                self.log_pmax = _np.log(self.pmax)
+                self.plotBitMap.fill(self.bg_color)
+                self.plotBackground()
+
+        _cls.initUI = initUI
+        _cls._sharpmod_surface_padding = True
+    except Exception:  # pragma: no cover - vendored module always present
+        pass
+
+
+def _install_skewt_surface_label_overlay():
+    """Repaint surface values last so no later trace can cut through them.
+
+    Upstream paints each value as its corresponding trace is drawn. Wet-bulb
+    comes first, followed by temperature, dewpoint, parcel traces, and level
+    annotations, so those later strokes can visibly slice through the text.
+    This lightweight ``plotData`` wrapper repeats only the label drawing after
+    upstream has finished the complete Skew-T. The painter proxy suppresses
+    paths, leaving the collision-aware label code in :meth:`drawTrace` as the
+    single source of placement behavior.
+    """
+    try:
+        import sharppy.viz.skew as _skew
+        _cls = _skew.plotSkewT
+        if getattr(_cls, "_sharpmod_surface_overlay", False):
+            return
+        _orig_plot_data = _cls.plotData
+        _QtGui = _skew.QtGui
+
+        class _LabelOnlyPainter:
+            def __init__(self, painter):
+                self._painter = painter
+
+            def drawPath(self, _path):  # noqa: N802 - mirrors Qt API
+                return None
+
+            def __getattr__(self, name):
+                return getattr(self._painter, name)
+
+        def plotData(self):
+            _orig_plot_data(self)
+            pixmap = getattr(self, "plotBitMap", None)
+            if pixmap is None or getattr(self, "prof", None) is None:
+                return
+            qp = _QtGui.QPainter()
+            if not qp.begin(pixmap):
+                return
+            try:
+                proxy = _LabelOnlyPainter(qp)
+                for values, color in (
+                        (getattr(self, "wetbulb", None),
+                         getattr(self, "wetbulb_color", "#00ffff")),
+                        (getattr(self, "tmpc", None),
+                         getattr(self, "temp_color", "#ff0000")),
+                        (getattr(self, "dwpc", None),
+                         getattr(self, "dewp_color", "#00ff00"))):
+                    if values is not None:
+                        self.drawTrace(values, color, proxy, width=0,
+                                       stdev=None, label=True)
+            finally:
+                qp.end()
+
+        _cls.plotData = plotData
+        _cls._sharpmod_surface_overlay = True
     except Exception:  # pragma: no cover - vendored module always present
         pass
 
@@ -1124,7 +1273,7 @@ ADV_TITLE_MAX_PT = int(os.environ.get("ADV_TITLE_MAX_PT", "9"))
 # dewpoint / wet-bulb). They sit close together, so the tall bundled font makes
 # their background masks overlap and erase each other; capping keeps all three
 # legible side-by-side.
-SFC_LABEL_MAX_PT = int(os.environ.get("SFC_LABEL_MAX_PT", "10"))
+SFC_LABEL_MAX_PT = int(os.environ.get("SFC_LABEL_MAX_PT", "12"))
 
 _speed_title_cap_installed = False
 _speed_0500_installed = False
@@ -1152,17 +1301,43 @@ def _fit_rect_to_skewt_plot(widget, qtcore, rect, pad=2):
     return qtcore.QRectF(left, top, width, height)
 
 
-def _skewt_surface_label_rect(widget, qtcore, center_x, line_y, width, height,
-                              below_offset=4, pad=2):
-    """Place a near-surface label below its line, or above it if needed."""
-    bottom_limit = float(getattr(
-        widget, "bry", getattr(widget, "hgt", line_y))) - pad
-    left = float(center_x) - float(width) / 2.0
+def _skewt_surface_label_rect(widget, qtcore, trace_x, line_y, width, height,
+                              below_offset=2, pad=2, anchor="center"):
+    """Place a surface value beneath its trace with semantic x anchoring.
+
+    The skew-T's ``bry`` is the bottom of its data box, not the bottom of the
+    widget; a small ``bpad`` strip remains below it specifically for labels.
+    Treating ``bry`` as the clipping limit forced surface values *above* their
+    trace endpoints.  Dewpoint labels use their right edge as the trace anchor,
+    temperature labels their left edge, and other traces remain centered.
+    """
+    try:
+        pixmap = getattr(widget, "plotBitMap", None)
+        bottom_limit = float(pixmap.height()) - pad \
+            if pixmap is not None else float(widget.height()) - pad
+    except (AttributeError, TypeError):
+        bottom_limit = float(getattr(
+            widget, "hgt", getattr(widget, "bry", line_y))) - pad
+
+    if anchor == "right":
+        left = float(trace_x) - float(width)
+    elif anchor == "left":
+        left = float(trace_x)
+    else:
+        left = float(trace_x) - float(width) / 2.0
     top = float(line_y) + below_offset
     if top + float(height) > bottom_limit:
         top = float(line_y) - below_offset - float(height)
-    rect = qtcore.QRectF(left, top, float(width), float(height))
-    return _fit_rect_to_skewt_plot(widget, qtcore, rect, pad=pad)
+
+    left_limit = float(getattr(widget, "lpad", 0)) + pad
+    right_limit = float(getattr(
+        widget, "brx", getattr(widget, "wid", left_limit))) - pad
+    fitted_width = min(float(width), max(1.0, right_limit - left_limit))
+    left = min(max(left, left_limit), right_limit - fitted_width)
+    top_limit = float(getattr(widget, "tpad", 0)) + pad
+    fitted_height = min(float(height), max(1.0, bottom_limit - top_limit))
+    top = min(max(top, top_limit), bottom_limit - fitted_height)
+    return qtcore.QRectF(left, top, fitted_width, fitted_height)
 
 
 def _speed_axis_label_font(base_font, qtgui, text, max_width, max_height,
@@ -1970,7 +2145,7 @@ def enlarge_canvas(win):
         pass
 
 
-def rebrand_version_label(win, text="SHARPpy Reimagined v0.2 (20260713)"):
+def rebrand_version_label(win, text="SHARPpy Reimagined vRust v0.2.0"):
     """Rename the vendored top-right ``SHARPpy v...`` label to the fork's brand.
 
     Returns the label widget (or ``None``) so callers can align it. Guarded so a
@@ -2114,12 +2289,11 @@ def save_widget_png(widget, outfile: str,
 def fetch_url(url: str, timeout: float = 30.0) -> bytes:
     """Fetch ``url`` over HTTPS with server-certificate verification enabled.
 
-    Uses :func:`ssl.create_default_context` (verification on) passed as
-    ``context=`` to :func:`urllib.request.urlopen`, with the ``certifi`` CA
-    bundle. This is the modern replacement for the removed
+    Uses a verified context containing platform, Certifi, and optional custom
+    CA roots. This is the modern replacement for the removed
     ``urlopen(cafile=...)`` shim (Requirement 11.6).
     """
-    context = ssl.create_default_context(cafile=certifi.where())
+    context = create_ssl_context()
     try:
         with urlopen(url, timeout=timeout, context=context) as response:
             return response.read()
@@ -3121,7 +3295,7 @@ def _install_custom_barbs():
 
 
 def _install_title_top():
-    """Nudge the skew-T title up by drawing it at ``TITLE_TOP`` instead of y=2.
+    """Draw skew-T titles inside a padded, bounded header band.
 
     Overrides ``plotSkewT.drawTitles`` with a copy that uses the configurable
     top offset; on any error it falls back to the vendored method so the render
@@ -3141,7 +3315,6 @@ def _install_title_top():
 
         def drawTitles(self, qp):
             try:
-                box_width = 150
                 cur_dt = self.prof_collections[self.pc_idx].getCurrentDate()
                 idxs, titles = list(zip(*[
                     (idx, self.getPlotTitle(pc))
@@ -3152,20 +3325,27 @@ def _install_title_top():
                 qp.setClipping(False)
                 qp.setFont(self.title_font)
                 qp.setPen(_QtGui.QPen(self.fg_color, 1, _QtCore.Qt.SolidLine))
-                rect0 = _QtCore.QRect(self.lpad, _top, box_width, self.title_height)
-                qp.drawText(rect0, _QtCore.Qt.TextDontClip | _QtCore.Qt.AlignLeft,
-                            main_title)
+                left = max(4, int(self.lpad) + 4)
+                right = max(left + 1, int(self.brx) - 4)
+                row_height = max(int(self.title_height),
+                                 _QtGui.QFontMetrics(self.title_font).height() + 2)
+                flags = (_QtCore.Qt.TextSingleLine | _QtCore.Qt.AlignLeft
+                         | _QtCore.Qt.AlignVCenter)
+                rect0 = _QtCore.QRect(left, max(2, _top),
+                                      right - left, row_height)
+                qp.drawText(rect0, flags, main_title)
                 bg = 0
                 for idx, title in enumerate(titles):
                     qp.setPen(_QtGui.QPen(
                         _QtGui.QColor(self.background_colors[bg]), 1,
                         _QtCore.Qt.SolidLine))
-                    rect0 = _QtCore.QRect(self.width() - box_width,
-                                          _top + idx * self.title_height,
-                                          box_width, self.title_height)
+                    rect0 = _QtCore.QRect(left,
+                                          max(2, _top) + idx * row_height,
+                                          right - left, row_height)
                     qp.drawText(rect0,
-                                _QtCore.Qt.TextDontClip | _QtCore.Qt.AlignRight,
-                                title)
+                                _QtCore.Qt.TextSingleLine
+                                | _QtCore.Qt.AlignRight
+                                | _QtCore.Qt.AlignVCenter, title)
                     bg = (bg + 1) % len(self.background_colors)
             except Exception:
                 _orig(self, qp)
@@ -3657,9 +3837,9 @@ def _install_title_override():
         run_s = run.strftime("%Y-%m-%d %Hz") if run is not None else ""
         valid_s = ("Valid: " + valid.strftime("%a %Y-%m-%d %Hz")
                    ) if valid is not None else ""
-        # Leading spaces indent the left-aligned title off the plot's left
-        # frame line so it isn't flush against the border.
-        title = "   %s %s F%03d  %s" % (model, run_s, fhr, valid_s)
+        # The title painter owns the real left padding; leading spaces are not
+        # reliable across fonts and were clipped at the widget boundary.
+        title = "%s %s F%03d  %s" % (model, run_s, fhr, valid_s)
 
         lat = _meta(prof_coll, "lat")
         lon = _meta(prof_coll, "lon")
@@ -3780,7 +3960,9 @@ def render(infile: str, outfile: str = "sharpmod_sounding.png",
         # Size the skew-T mixing-ratio + surface-value label masks to the font
         # so background lines stop bleeding through the (wider-font) digits.
         _install_skewt_mixratio_mask()
+        _install_skewt_surface_padding()
         _install_skewt_sfc_label_mask()
+        _install_skewt_surface_label_overlay()
         _install_skewt_effective_layer_label_fit()
         # Redraw the white skew-T outline on top so label masks never gap it.
         _install_skewt_frame_ontop()

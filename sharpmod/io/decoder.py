@@ -28,17 +28,17 @@ import importlib.machinery
 import importlib.util
 import logging
 import os
-import ssl
 import sys
 from datetime import datetime
 from urllib.error import URLError
 from urllib.request import urlopen
 
-import certifi
 import numpy as np
 
 import sharppy.sharptab.profile as profile
 import sharppy.sharptab.prof_collection as prof_collection
+
+from sharpmod.io.tls import create_ssl_context
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ class Decoder(object):
         the removed ``cafile`` keyword argument.
         """
         try:
-            context = ssl.create_default_context(cafile=certifi.where())
+            context = create_ssl_context()
             f = urlopen(self._file_name, context=context)
         except (ValueError, URLError, IOError):
             fname = self._file_name[7:] \

@@ -13,6 +13,63 @@ import pytest
 
 from sharpmod.io import decoder as decoder_mod
 from sharpmod.tools import model_extract
+
+
+@pytest.fixture(autouse=True)
+def _force_python_backend_for_extractor_unit_tests(monkeypatch):
+    """Keep mocked extractor tests isolated from bundled native binaries."""
+    monkeypatch.setenv("SHARPMOD_MODEL_BACKEND", "python")
+
+
+def test_candidate_runs_walk_back_across_model_cycles():
+    runs = model_extract.candidate_run_times(
+        "gfs", datetime(2026, 7, 13, 13, tzinfo=timezone.utc), max_cycles=4)
+
+    assert [run.strftime("%Y-%m-%d %H") for run in runs] == [
+        "2026-07-13 12", "2026-07-13 06", "2026-07-13 00",
+        "2026-07-12 18",
+    ]
+
+
+def test_extract_falls_back_to_previous_available_cycle(monkeypatch, tmp_path):
+    requested = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+    seen = []
+
+    def fake_probe(model, run_time=None, **kwargs):
+        return {"available": run_time.hour == 6}
+
+    def fake_extract(model, lat, lon, run_time=None, out_path=None, **kwargs):
+        seen.append(run_time)
+        return out_path
+
+    monkeypatch.setattr(model_extract, "probe", fake_probe)
+    monkeypatch.setattr(model_extract, "extract", fake_extract)
+    out = tmp_path / "sounding.npz"
+
+    path, resolved = model_extract.extract_with_cycle_fallback(
+        "gfs", 35.0, -97.0, run_time=requested, out_path=str(out),
+        max_cycles=3)
+
+    assert path == str(out)
+    assert resolved == datetime(2026, 7, 13, 6, tzinfo=timezone.utc)
+    assert seen == [resolved]
+
+
+def test_extract_fallback_error_lists_checked_cycles(monkeypatch, tmp_path):
+    requested = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        model_extract, "probe",
+        lambda *args, **kwargs: {"available": False, "error": "not found"})
+
+    with pytest.raises(model_extract.RetrievalError) as caught:
+        model_extract.extract_with_cycle_fallback(
+            "gfs", 35.0, -97.0, run_time=requested,
+            out_path=str(tmp_path / "sounding.npz"), max_cycles=2)
+
+    message = str(caught.value)
+    assert "2026-07-13 12Z" in message
+    assert "2026-07-13 06Z" in message
+    assert "not found" in message
 from sharpmod.tests.era5_synth import make_era5_dataset
 
 

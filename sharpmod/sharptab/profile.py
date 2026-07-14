@@ -70,7 +70,10 @@ from . import ecape as ecape_mod
 from . import derived
 from .constants import MISSING, is_missing, PARAM_REGISTRY
 
-__all__ = ["Profile", "create_profile", "DERIVED_ATTRS"]
+__all__ = [
+    "Profile", "create_profile", "DERIVED_ATTRS",
+    "DISPLAY_DERIVED_ATTRS", "derived_profile_from",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +138,16 @@ _ATTR_TO_GROUP = {
 
 #: The complete set of lazily computed derived attribute names.
 DERIVED_ATTRS = frozenset(_SINGLE_COMPUTE) | frozenset(_ATTR_TO_GROUP)
+
+# Values consumed by the interactive IndexBoard.  Warming these in an existing
+# fetch/decode worker moves the expensive ECAPE/MetPy work off Qt's UI thread;
+# the lazy Profile still caches each result exactly as before.
+DISPLAY_DERIVED_ATTRS = (
+    "lapserate_sfc_500m", "lapserate_sfc_1km", "lrghail", "dcp",
+    "srh500", "shear_sfc_500m", "mean_wind_sfc_500m", "srw_sfc_500m",
+    "peskov", "mcs_index", "ehi_0_1km", "ehi_0_3km", "lscp", "nstp",
+    "modified_sherbe", "vgp", "hgz_cape", "ncape", "wbz_height", "ecape",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -353,3 +366,64 @@ def create_profile(pres, hght, tmpc, dwpc, wdir, wspd, omeg=None,
         pres=pres, hght=hght, tmpc=tmpc, dwpc=dwpc, wdir=wdir, wspd=wspd,
         omeg=omeg, wetbulb=wetbulb, meta=meta,
     )
+
+
+def derived_profile_from(prof, *, warm=()):
+    """Return and optionally warm one cached derived companion profile.
+
+    ``prof`` is normally SHARPpy's analyzed ``ConvectiveProfile``.  Building a
+    second companion on every redraw needlessly repeats conversion work, while
+    calculating its display fields during window composition blocks Qt for
+    several seconds on a cold process.  Cache the companion on the analyzed
+    profile and let fetch/decode workers eagerly resolve only the values the
+    IndexBoard displays.
+    """
+    if prof is None:
+        return None
+    if isinstance(prof, Profile):
+        derived = prof
+    else:
+        derived = getattr(prof, "_sharpmod_derived_profile", None)
+        if not isinstance(derived, Profile):
+            raw_meta = getattr(prof, "meta", None)
+            meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+            for key, attr in (
+                ("date", "date"), ("valid", "date"),
+                ("location", "location"), ("loc", "location"),
+            ):
+                if key not in meta:
+                    value = getattr(prof, attr, None)
+                    if value is not None:
+                        meta[key] = value
+            for key, attr in (
+                ("lat", "latitude"), ("lon", "longitude"),
+                ("sfc_relative_vorticity", "sfc_relative_vorticity"),
+                ("surface_relative_vorticity", "surface_relative_vorticity"),
+                ("sfc_vorticity", "sfc_vorticity"),
+                ("surface_vorticity", "surface_vorticity"),
+                ("vorticity", "vorticity"),
+            ):
+                if key in meta:
+                    continue
+                value = getattr(prof, attr, None)
+                try:
+                    fval = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(fval):
+                    meta[key] = fval
+            derived = create_profile(
+                pres=prof.pres, hght=prof.hght, tmpc=prof.tmpc,
+                dwpc=prof.dwpc, wdir=prof.wdir, wspd=prof.wspd,
+                omeg=getattr(prof, "omeg", None),
+                wetbulb=getattr(prof, "wetbulb", None), meta=meta,
+            )
+            try:
+                prof._sharpmod_derived_profile = derived
+            except Exception:
+                pass
+
+    for name in warm:
+        if name in DERIVED_ATTRS:
+            getattr(derived, name, None)
+    return derived

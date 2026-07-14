@@ -1,10 +1,10 @@
 <div align="center">
 
-# SHARPpy Reimagined
+# SHARPpy Reimagined vRust
 
-**Modern sounding analysis and SHARPpy-style rendering for Python 3.11+.**
+**Modern sounding analysis with Rust-accelerated model ingest and analytic ECAPE, plus SHARPpy-style rendering for Python 3.11+.**
 
-[![Tests](https://github.com/ShianMike/SHARPpy-Reimagined/actions/workflows/tests.yml/badge.svg)](https://github.com/ShianMike/SHARPpy-Reimagined/actions/workflows/tests.yml)
+[![Tests](https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust/actions/workflows/tests.yml/badge.svg)](https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![Qt6](https://img.shields.io/badge/Qt6-PySide6-41CD52?logo=qt&logoColor=white)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
@@ -20,6 +20,14 @@ It keeps the familiar SPC-style skew-T, hodograph, hazard, and derived-parameter
 views while adding clean command-line entry points, bundled resources, and a
 test-backed decoder/extractor layer.
 
+## Download for Windows
+
+The [latest GitHub release](https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust/releases/latest)
+provides both a single `SHARPpy-Reimagined-vRust-*-windows-x64.exe` and a
+portable one-folder `.zip`. Neither requires Python. Download the EXE and run
+it directly; use the ZIP if antivirus or startup performance makes the
+self-extracting build inconvenient.
+
 ## Highlights
 
 - Headless PNG rendering for `.npz`, SPC tabular, BUFKIT, PECAN, and WRF-ARW
@@ -33,11 +41,22 @@ test-backed decoder/extractor layer.
 
 ## Quick Start
 
-Requires Python 3.11 or newer.
+Requires Python 3.11 or newer. Start from a repository checkout and use an
+isolated environment:
 
 ```bash
-python -m pip install -e ".[render]"
+git clone https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust.git
+cd SHARPpy-Reimagined-vRust
+python -m venv .venv
+
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install ".[render]"
 python -m pip install --no-deps "SHARPpy==1.4.0a5"
+
+python -c "import sharpmod, sharppy, sutils, PySide6, qtpy; print('imports OK')"
 
 sharpmod-render examples/soundings/hrrr_point_36.68N_95.66W_f018.npz out.png
 ```
@@ -47,7 +66,9 @@ sharpmod-render examples/soundings/hrrr_point_36.68N_95.66W_f018.npz out.png
 
 The upstream `SHARPpy==1.4.0a5` package is installed with `--no-deps` because
 its published metadata pins an old NumPy version. SHARPpy Reimagined provides
-the modern runtime dependencies separately.
+the modern runtime dependencies separately. Contributors who intend to edit
+the checkout can replace `pip install ".[render]"` with the editable form
+`pip install -e ".[render]"`.
 
 ## Desktop GUI
 
@@ -110,8 +131,9 @@ python -m pip install pyinstaller
 pyinstaller packaging/sharpmod_gui.spec --noconfirm
 ```
 
-The result is `dist/SHARPpy-Reimagined/SHARPpy-Reimagined.exe`. Set
-`ONEFILE = True` in the spec for a single self-extracting `.exe` instead.
+The result is
+`dist/SHARPpy-Reimagined-vRust/SHARPpy-Reimagined-vRust.exe`. Set
+`SHARPMOD_ONEFILE=1` for a single self-extracting `.exe` instead.
 
 ## Command Line Tools
 
@@ -165,7 +187,10 @@ usage recipes and Python API examples, see [`docs/USAGE.md`](docs/USAGE.md).
 ## Data Flow
 
 ```text
-UWyo / ERA5 / WRF / HRRR
+UWyo / ERA5 / WRF / forecast models
+          |
+          v
+ Rusty Weather (HRRR/GFS/RRFS-A, automatic when bundled)
           |
           v
 portable .npz point sounding
@@ -187,7 +212,7 @@ sharpmod/
   io/           decoders for SPC, BUFKIT, PECAN, WRF-ARW, .npz, and UWyo
   viz/          Qt6/PySide6 rendering widgets
   tools/        UWyo, ERA5, WRF, basemap, and render command-line tools
-  resources/    bundled fonts, station catalog, and GUI basemap/icons
+  resources/    bundled fonts, station catalog, GUI assets, and Rust backend
   tests/        unit, smoke, and property-based tests
 
 packaging/
@@ -205,4 +230,8 @@ docs/
 
 This project builds on the abandoned upstream
 [SHARPpy](https://github.com/sharppy/SHARPpy) project. See [`LICENSE`](LICENSE)
-for license terms and attribution.
+for license terms and attribution. This is an independent fork and is not
+endorsed by the upstream SHARPpy or MetPy contributors. The optional model backend is built from
+[Rusty Weather](https://github.com/FahrenheitResearch/rusty-weather) under its
+MIT license; the optional native analysis extension is
+[sharprs](https://github.com/FahrenheitResearch/sharprs) under BSD-3-Clause.

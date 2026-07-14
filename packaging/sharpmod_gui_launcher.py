@@ -22,18 +22,29 @@ def _model_fetch_runtime_check(output_path: str) -> int:
     }
     try:
         import cfgrib
+        import ecape_parcel
         import eccodes
         import herbie
         import xarray
 
+        from sharpmod.sharptab import native_ecape
         from sharpmod.tools import model_extract
+        from sharpmod.tools import rusty_weather
+
+        if not native_ecape.available():
+            raise RuntimeError("bundled rw_ecape_analytic executable is missing")
+        if not rusty_weather.is_available("hrrr"):
+            raise RuntimeError("bundled Rusty Weather model executables are missing")
 
         result.update(
             cfgrib=cfgrib.__version__,
+            ecape_parcel=getattr(ecape_parcel, "__version__", "installed"),
             eccodes=eccodes.codes_get_api_version(),
             herbie=herbie.__version__,
             xarray=xarray.__version__,
             configured_models=len(model_extract.available_models()),
+            native_ecape=True,
+            rusty_weather=True,
             ok=True,
         )
     except BaseException as exc:  # noqa: BLE001 - diagnostics must be recorded

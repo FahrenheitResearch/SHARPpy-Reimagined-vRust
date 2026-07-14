@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import re
 import socket
-import ssl
 from datetime import datetime
 from functools import lru_cache
 from urllib.error import URLError
@@ -33,11 +32,7 @@ try:  # Python 3.9+: importlib.resources.files
 except Exception:  # pragma: no cover - very old Pythons
     _res_files = None
 
-try:  # certifi is a declared runtime dependency; fall back gracefully.
-    import certifi
-    _CA_FILE = certifi.where()
-except Exception:  # pragma: no cover - certifi always present in practice
-    _CA_FILE = None
+from sharpmod.io.tls import create_ssl_context
 
 __all__ = [
     "load_catalog",
@@ -223,8 +218,8 @@ def fetch_stations_for_datetime(when_utc: datetime,
             f"observation time must be a datetime, got {when_utc!r}")
 
     url = _build_station_list_url(when_utc)
-    context = ssl.create_default_context(cafile=_CA_FILE)
     try:
+        context = create_ssl_context()
         with urlopen(url, timeout=timeout, context=context) as resp:
             raw = resp.read()
     except (socket.timeout, TimeoutError) as exc:

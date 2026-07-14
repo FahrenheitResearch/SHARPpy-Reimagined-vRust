@@ -1,4 +1,4 @@
-# SHARPpy Reimagined Sounding Parameter Guide
+# SHARPpy Reimagined vRust Sounding Parameter Guide
 
 This guide describes what the application currently calculates and displays. It is implementation documentation, not a claim that every formula is the only meteorologically valid definition of that parameter.
 
@@ -562,7 +562,11 @@ Both are reported in J/kg/m. NCIN remains negative.
 
 ### Entraining CAPE (ECAPE)
 
-The displayed ECAPE calculation uses the Peters-style analytic expression:
+The displayed ECAPE calculation uses the Peters-style analytic expression. On
+Windows the bundled standalone `ecape-rs` solver is the normal fast path;
+`ecape-parcel-py` computes the same analytic diagnostic as the cross-platform
+fallback and numerical reference. A final local implementation remains
+available if neither external path can resolve the profile.
 
 ```math
 a=\frac{\psi}{V_{SR}^{2}},

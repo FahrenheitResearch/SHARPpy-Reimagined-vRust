@@ -1,4 +1,4 @@
-# SHARPpy Reimagined Usage Guide
+# SHARPpy Reimagined vRust Usage Guide
 
 This guide covers **how to use** SHARPpy Reimagined once it is installed. For setting up
 the environment and dependencies, see the "Installation" section of the
@@ -77,9 +77,14 @@ The app opens on the **Sounding Picker** with four tabs:
 - **Station List** — the station catalogue with live id/name filtering; type to
   narrow, pick a station and time, then fetch.
 - **Forecast Model** — choose a supported public model, run, forecast hour, and
-  map point. Every published pressure level is fetched. The isolated GRIB and
-  point-sounding data remain available while the sounding window is open, then
-  are deleted when that window closes.
+  map point. HRRR, GFS, and RRFS-A use the bundled Rusty Weather acquisition
+  backend automatically; other models use Herbie. A missing or failed Rust
+  fetch falls back to Herbie without changing the GUI. Temporary point files
+  are deleted when the sounding window closes, while reusable Rust model hours
+  remain in a bounded cache. Fetch progress and elapsed time remain visible in
+  the picker without locking the rest of the interface. After the first model
+  sounding opens, each single click on the model map refreshes that same
+  interactive plot instead of opening another window.
 - **Open File** — load a local `.npz`, SPC (`.spc`/`.OAX`), BUFKIT (`.buf`),
   PECAN, or WRF-ARW text sounding. You can also **drag a file onto the window**.
 
@@ -91,6 +96,23 @@ as a fallback until the live list arrives (or if the network is unavailable).
 
 Fetches run on a background thread, so the window stays responsive while a UWyo
 sounding downloads.
+
+### Accelerated forecast-model cache
+
+Rusty Weather stores each successfully fetched model hour under
+`%LOCALAPPDATA%/SHARPpy-Reimagined/rusty-weather` on Windows (or
+`~/.cache/sharpmod/rusty-weather` elsewhere). Source GRIB files are discarded
+after the compact `.rws` hour is written. The store is capped at 4 GiB by
+default and removes the oldest complete runs first.
+
+Advanced overrides:
+
+- `SHARPMOD_MODEL_BACKEND=python` disables Rust and always uses Herbie.
+- `SHARPMOD_MODEL_BACKEND=rust` requires Rust and reports native failures.
+- `SHARPMOD_RUST_CACHE_GB=8` changes the store cap; a non-positive value
+  disables pruning.
+- `SHARPMOD_KEEP_RAW_GRIB=1` retains source GRIB downloads.
+- `SHARPMOD_RUSTY_WEATHER_CACHE=<path>` relocates the cache.
 
 ### Explore and edit a sounding
 
@@ -128,7 +150,8 @@ python -m pip install pyinstaller
 pyinstaller packaging/sharpmod_gui.spec --noconfirm
 ```
 
-The result is `dist/SHARPpy-Reimagined/SHARPpy-Reimagined.exe`. See the README
+The result is
+`dist/SHARPpy-Reimagined-vRust/SHARPpy-Reimagined-vRust.exe`. See the README
 for the one-file variant.
 
 ---
@@ -369,6 +392,9 @@ wrf-extract wrfout_d02_2024-05-20_00:00:00 41.32 -96.37 oax_wrf.npz --render
   didn't report at that hour; try 00Z or 12Z, or a nearby date.
 - **`era5-extract` / `wrf-extract` import errors** — install the matching extra:
   `pip install -e ".[era5]"` or `pip install -e ".[wrf]"`.
+- **A forecast model repeatedly fails in native mode** — remove
+  `SHARPMOD_MODEL_BACKEND=rust` (or set it to `auto`) to restore automatic
+  Herbie fallback. The GUI itself is unchanged by the backend choice.
 - **A rendered PNG looks empty / a widget overflows** — extremely degenerate
   input (e.g. constant winds at every level) can overflow the storm-relative
   hodograph; use real data.

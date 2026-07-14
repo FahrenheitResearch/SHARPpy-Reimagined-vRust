@@ -22,10 +22,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -49,7 +49,7 @@ jobs:
         run: |
           $report = Join-Path $env:RUNNER_TEMP "model-fetch-runtime.json"
           $process = Start-Process `
-            -FilePath "dist/SHARPpy-Reimagined/SHARPpy-Reimagined.exe" `
+            -FilePath "dist/SHARPpy-Reimagined-vRust/SHARPpy-Reimagined-vRust.exe" `
             -ArgumentList "--model-fetch-runtime-check", $report `
             -Wait -PassThru
           if ($process.ExitCode -ne 0) {
@@ -81,28 +81,28 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
-          Compress-Archive -Path "dist/SHARPpy-Reimagined/*" `
-            -DestinationPath "dist/SHARPpy-Reimagined-$tag-windows-x64.zip" -Force
-          Copy-Item "dist/SHARPpy-Reimagined.exe" `
-            "dist/SHARPpy-Reimagined-$tag-windows-x64.exe" -Force
+          Compress-Archive -Path "dist/SHARPpy-Reimagined-vRust/*" `
+            -DestinationPath "dist/SHARPpy-Reimagined-vRust-$tag-windows-x64.zip" -Force
+          Copy-Item "dist/SHARPpy-Reimagined-vRust.exe" `
+            "dist/SHARPpy-Reimagined-vRust-$tag-windows-x64.exe" -Force
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-build
           path: |
-            dist/SHARPpy-Reimagined-*-windows-x64.zip
-            dist/SHARPpy-Reimagined-*-windows-x64.exe
+            dist/SHARPpy-Reimagined-vRust-*-windows-x64.zip
+            dist/SHARPpy-Reimagined-vRust-*-windows-x64.exe
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: SHARPpy Reimagined ${{ steps.tag.outputs.tag }}
+          name: SHARPpy Reimagined vRust ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/SHARPpy-Reimagined-*-windows-x64.zip
-            dist/SHARPpy-Reimagined-*-windows-x64.exe
+            dist/SHARPpy-Reimagined-vRust-*-windows-x64.zip
+            dist/SHARPpy-Reimagined-vRust-*-windows-x64.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

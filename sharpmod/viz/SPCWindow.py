@@ -200,9 +200,37 @@ class RenderController(QWidget):
         return None
 
 
+def _construct_spc_window(controller, config, defer_show=False):
+    """Construct SPCWindow, optionally realizing its layout off screen."""
+    if not defer_show:
+        return SPCWindow(parent=controller, cfg=config)
+    original_show = SPCWindow.show
+    original_raise = SPCWindow.raise_
+
+    def realize_offscreen(window):
+        # Qt must execute a real show/layout cycle for the vendored widgets to
+        # settle their natural geometry. WA_DontShowOnScreen allows that cycle
+        # without giving the Windows compositor a blank native surface.
+        window.setAttribute(Qt.WA_DontShowOnScreen, True)
+        original_show(window)
+
+    try:
+        SPCWindow.show = realize_offscreen
+        SPCWindow.raise_ = lambda self: None
+        window = SPCWindow(parent=controller, cfg=config)
+    finally:
+        SPCWindow.show = original_show
+        SPCWindow.raise_ = original_raise
+    # Preserve the realized geometry, but return hidden and eligible for the
+    # final normal on-screen show after composition and scaling complete.
+    window.hide()
+    window.setAttribute(Qt.WA_DontShowOnScreen, False)
+    return window
+
+
 def compose_window(config, prof_col=None, *, check_integrity=False,
                    mount=False, custom_config=None, custom_sars_lines=None,
-                   controller=None):
+                   controller=None, defer_show=False):
     """Compose an :class:`SPCWindow` with a real :class:`RenderController`.
 
     Parameters
@@ -248,7 +276,10 @@ def compose_window(config, prof_col=None, *, check_integrity=False,
     _install_streamwiseness_hooks()
     if controller is None:
         controller = RenderController(config)
-    win = SPCWindow(parent=controller, cfg=config)
+    # Upstream calls show()/raise_() inside __initUI, before a profile is
+    # attached or any of this fork's panels/layout work exists. Interactive
+    # callers defer those calls so a native blank window is never created.
+    win = _construct_spc_window(controller, config, defer_show=defer_show)
     if prof_col is not None:
         win.addProfileCollection(prof_col, check_integrity=check_integrity)
     # Re-apply the palette with update_gui=True so every inset recomputes
@@ -595,52 +626,8 @@ def _derived_profile(prof):
     if prof is None:
         return None
     try:
-        from sharpmod.sharptab.profile import Profile as _SMProfile
-        from sharpmod.sharptab.profile import create_profile as _sm_create
-    except Exception:
-        return prof
-    # Already a SHARPpy Reimagined Profile -> read its derived attributes directly.
-    if isinstance(prof, _SMProfile):
-        return prof
-    try:
-        raw_meta = getattr(prof, "meta", None)
-        meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
-        for key, attr in (
-            ("date", "date"),
-            ("valid", "date"),
-            ("location", "location"),
-            ("loc", "location"),
-        ):
-            if key in meta:
-                continue
-            value = getattr(prof, attr, None)
-            if value is not None:
-                meta[key] = value
-        for key, attr in (
-            ("lat", "latitude"),
-            ("lon", "longitude"),
-            ("sfc_relative_vorticity", "sfc_relative_vorticity"),
-            ("surface_relative_vorticity", "surface_relative_vorticity"),
-            ("sfc_vorticity", "sfc_vorticity"),
-            ("surface_vorticity", "surface_vorticity"),
-            ("vorticity", "vorticity"),
-        ):
-            if key in meta:
-                continue
-            value = getattr(prof, attr, None)
-            try:
-                fval = float(value)
-            except (TypeError, ValueError):
-                continue
-            if fval == fval:
-                meta[key] = fval
-        return _sm_create(
-            pres=prof.pres, hght=prof.hght, tmpc=prof.tmpc, dwpc=prof.dwpc,
-            wdir=prof.wdir, wspd=prof.wspd,
-            omeg=getattr(prof, "omeg", None),
-            wetbulb=getattr(prof, "wetbulb", None),
-            meta=meta,
-        )
+        from sharpmod.sharptab.profile import derived_profile_from
+        return derived_profile_from(prof)
     except Exception:
         return prof
 

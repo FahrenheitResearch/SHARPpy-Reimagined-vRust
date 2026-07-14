@@ -6,13 +6,12 @@ This module implements the analytic entraining-CAPE formula of
     (2023). "An analytic formula for entraining CAPE in mid-latitude storm
     environments." *J. Atmos. Sci.* (arXiv:2301.04712).
 
-The analytic result expresses ECAPE as a closed-form function of a handful of
-state quantities derived from the environmental sounding (undiluted CAPE, the
-buoyancy-dilution potential ``NCAPE``, the 0-1 km storm-relative inflow, and the
-equilibrium-level height) plus a set of published constant parameters. The
-reference Python implementation used as the validation oracle is the authors'
-``ECAPE_FUNCTIONS`` (mirrored by the ``ecape`` PyPI package's ``calc_ecape``);
-the term-by-term structure below follows that reference exactly.
+The primary implementation is the bundled standalone ``ecape-rs`` analytic
+solver. It is checked against ``ecape-parcel-py`` (the maintained Python
+reference implementation); that Python implementation is also the automatic
+fallback when the native executable is missing or cannot process a profile.
+The local term-by-term implementation below remains a final compatibility
+fallback.
 
 Design contract (SHARPpy Reimagined design.md, Requirement 5):
 
@@ -26,8 +25,8 @@ Design contract (SHARPpy Reimagined design.md, Requirement 5):
   missing or masked, return :data:`~sharpmod.sharptab.constants.MISSING` rather
   than a numeric result. The function *never raises* -- any unexpected failure
   is caught and reported as ``MISSING``.
-* 5.7 -- the returned value agrees with the authors' ``ECAPE_FUNCTIONS``
-  reference (``ecape.calc.calc_ecape``) within ``max(5%, 10 J/kg)``.
+* 5.7 -- the returned value agrees with ``ecape-parcel-py``
+  (``ecape_parcel.ecape_calc.calc_ecape``) within ``max(5%, 10 J/kg)``.
 
 Building-block reconciliation (Requirement 5.7 / Property 10)
 -------------------------------------------------------------
@@ -272,6 +271,36 @@ def _sharppy_mucape(pres_f, hght_f, tmpc_f, dwpc_f, wdir_f, wspd_f):
     return float(cape)
 
 
+def _ecape_parcel_reference(pres_f, hght_f, tmpc_f, dwpc_f, u_kt_f, v_kt_f):
+    """Return analytic MU ECAPE from ``ecape-parcel-py``, or ``None``.
+
+    This is deliberately isolated behind a lazy import: the bundled Rust
+    solver is the normal path, while this maintained reference implementation
+    provides a numerically close fallback on unsupported platforms or profiles.
+    """
+    try:
+        from ecape_parcel.ecape_calc import calc_ecape
+        from metpy.units import units
+        import metpy.calc as mpcalc
+
+        p = pres_f * units.hPa
+        z = hght_f * units.meter
+        t = tmpc_f * units.degC
+        td = dwpc_f * units.degC
+        q = mpcalc.specific_humidity_from_dewpoint(p, td)
+        u_ms = (u_kt_f / KTS_PER_MS) * units("m/s")
+        v_ms = (v_kt_f / KTS_PER_MS) * units("m/s")
+        value = calc_ecape(
+            z, p, t, q, u_ms, v_ms,
+            cape_type="most_unstable",
+            storm_motion="right_moving",
+        )
+        result = float(np.asarray(value.to("J/kg").magnitude))
+    except Exception:
+        return None
+    return result if np.isfinite(result) and result >= 0.0 else None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -292,9 +321,8 @@ def ecape(prof):
         ECAPE in J/kg (``>= 0`` and ``<= undiluted MUCAPE``); exactly ``0.0``
         when the undiluted CAPE is zero (Req 5.5); and
         :data:`~sharpmod.sharptab.constants.MISSING` when a required pressure /
-        temperature / moisture / wind datum is missing or masked, when MetPy is
-        unavailable, or when the ascent cannot be resolved (Req 5.6). Never
-        raises.
+        temperature / moisture / wind datum is missing or masked, or when no
+        available solver can resolve the ascent (Req 5.6). Never raises.
     """
     try:
         return _ecape_impl(prof)
@@ -362,7 +390,34 @@ def _ecape_impl(prof):
     if mucape_bound is not None and mucape_bound <= 0.0:
         return 0.0
 
-    # --- MetPy building blocks for the analytic core (mirror ECAPE_FUNCTIONS)
+    # Fast path: the bundled standalone ecape-rs analytic solver. A malformed
+    # response, timeout, absent binary, or unsupported profile safely returns
+    # None from the bridge and falls through to the Python reference.
+    try:
+        from .native_ecape import analytic_ecape
+        native = analytic_ecape(
+            pres_f, hght_f, tmpc_f, dwpc_f, u_kt_f, v_kt_f)
+    except Exception:
+        native = None
+    if native is not None:
+        upper = mucape_bound if mucape_bound is not None else native.cape
+        if not np.isfinite(upper) or upper <= 0.0:
+            return 0.0
+        return max(0.0, min(float(native.ecape), float(upper)))
+
+    # Cross-platform/reference fallback. This is the same analytic quantity,
+    # not the distinct post-entraining ``ecape_jkg`` field exposed by the
+    # full parcel-path API.
+    reference = _ecape_parcel_reference(
+        pres_f, hght_f, tmpc_f, dwpc_f, u_kt_f, v_kt_f)
+    if reference is not None:
+        upper = mucape_bound if mucape_bound is not None else reference
+        if not np.isfinite(upper) or upper <= 0.0:
+            return 0.0
+        return max(0.0, min(float(reference), float(upper)))
+
+    # Final compatibility fallback: reproduce the analytic terms locally with
+    # MetPy-derived building blocks.
     blocks = _building_blocks(pres_f, hght_f, tmpc_f, dwpc_f, u_kt_f, v_kt_f)
     if blocks is None:
         return MISSING

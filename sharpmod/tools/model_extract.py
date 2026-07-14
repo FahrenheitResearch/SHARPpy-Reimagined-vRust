@@ -13,7 +13,7 @@ import shutil
 import tempfile
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -283,6 +283,107 @@ def _run_datetime(run_time, config):
     if run_time is None:
         return _floor_to_cycle(datetime.now(timezone.utc), config.cycles)
     return _floor_to_cycle(run_time, config.cycles)
+
+
+def candidate_run_times(model, run_time=None, max_cycles=8):
+    """Return the requested run followed by earlier valid model cycles."""
+    config = get_config(model)
+    candidate = _run_datetime(run_time, config)
+    out = []
+    for _ in range(max(1, int(max_cycles))):
+        out.append(candidate)
+        candidate = _floor_to_cycle(candidate - timedelta(hours=1),
+                                    config.cycles)
+    return tuple(out)
+
+
+def extract_with_cycle_fallback(
+        model, lat, lon, run_time=None, fxx=0, out_path=None, loc=None,
+        member=None, download_dir=None, max_cycles=8, progress=None):
+    """Extract from the requested cycle or the nearest earlier available one.
+
+    Herbie knows about nominal cycle times before every provider has published
+    the corresponding files.  The GUI uses this helper so "Most recent" does
+    not fail merely because publication is still in progress, and so an aged
+    or missing individual cycle automatically falls back with a precise list
+    of the cycles that were checked.
+    """
+    config = get_config(model)
+    lat = float(lat)
+    lon = float(lon)
+    _validate_lat_lon(lat, lon)
+    if not point_in_domain(config, lat, lon):
+        raise ParameterRangeError(
+            "%s covers %s (%s); requested point %.4f, %.4f is outside "
+            "that domain" % (
+                config.label, config.domain, config.domain_bounds, lat, lon))
+
+    candidates = candidate_run_times(
+        config.key, run_time=run_time, max_cycles=max_cycles)
+    attempts = []
+
+    # Rusty Weather is an optional acquisition/cache backend. In ``auto``
+    # mode any Rust failure cleanly falls through to the established Herbie
+    # path; ``SHARPMOD_MODEL_BACKEND=rust`` makes failures explicit for
+    # deployments that require the accelerator.
+    from sharpmod.tools import rusty_weather
+    if rusty_weather.backend_mode() == "rust" \
+            and not rusty_weather.is_available(config.key):
+        if config.key not in rusty_weather.SUPPORTED_MODELS:
+            detail = f"model {config.key!r} is not supported"
+        else:
+            detail = "the rw_ingest and rw_sharpmod executables were not found"
+        raise RetrievalError(f"Rusty Weather backend required, but {detail}")
+    if rusty_weather.is_available(config.key):
+        rust_attempts = []
+        for candidate in candidates:
+            try:
+                return rusty_weather.extract(
+                    config.key, lat, lon, run_time=candidate, fxx=fxx,
+                    out_path=out_path, label=config.label, loc=loc,
+                    progress=progress)
+            except RetrievalError as exc:
+                rust_attempts.append((candidate, str(exc)))
+        if rusty_weather.backend_mode() == "rust":
+            checked = ", ".join(
+                f"{run:%Y-%m-%d %H}Z" for run, _ in rust_attempts)
+            last_error = rust_attempts[-1][1] \
+                if rust_attempts else "no Rust backend response"
+            raise RetrievalError(
+                f"no downloadable {config.label} F{int(fxx):03d} run was "
+                f"found by Rusty Weather; checked {checked}. "
+                f"Last error: {last_error}")
+        attempts.extend(rust_attempts)
+        if progress is not None:
+            progress("Native provider unavailable; trying Python provider", 8)
+
+    for candidate in candidates:
+        if progress is not None:
+            progress(f"Checking {candidate:%Y-%m-%d %H}Z availability", 10)
+        info = probe(config.key, run_time=candidate, fxx=fxx, member=member)
+        if not info.get("available"):
+            detail = info.get("error") or "file/inventory not published"
+            attempts.append((candidate, str(detail)))
+            continue
+        try:
+            if progress is not None:
+                progress("Downloading pressure-level model subset", 20)
+            path = extract(
+                config.key, lat, lon, run_time=candidate, fxx=fxx,
+                out_path=out_path, loc=loc, member=member,
+                download_dir=download_dir)
+        except RetrievalError as exc:
+            attempts.append((candidate, str(exc)))
+            continue
+        if progress is not None:
+            progress("Model subset decoded; preparing sounding", 84)
+        return path, candidate
+
+    checked = ", ".join(f"{run:%Y-%m-%d %H}Z" for run, _ in attempts)
+    last_error = attempts[-1][1] if attempts else "no provider response"
+    raise RetrievalError(
+        f"no downloadable {config.label} F{int(fxx):03d} run was found; "
+        f"checked {checked}. Last provider error: {last_error}")
 
 
 def _herbie_kwargs(config, member=None):

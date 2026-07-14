@@ -16,10 +16,10 @@ Reference oracles
 Per the design's "Property 10" note, each parameter is checked against its
 documented reference oracle over a documented set of >= 10 soundings:
 
-* **ECAPE** -- the ECAPE authors' reference implementation, the ``ECAPE_FUNCTIONS``
-  (mirrored by the ``ecape`` PyPI package). This oracle is optional in the test
+* **ECAPE** -- ``ecape-parcel-py``, the maintained Python implementation of the
+  Peters analytic ECAPE calculation. This oracle is optional in the test
   environment; :func:`test_ecape_matches_reference_oracle` gates it with
-  ``pytest.importorskip("ecape")`` and is *skipped* (not failed) when the
+  ``pytest.importorskip("ecape_parcel")`` and is *skipped* (not failed) when the
   package is unavailable.
 * **All remaining parameters** -- SPC Mesoanalysis formulas / upstream SHARPpy
   values, obtained from the installed ``sharppy`` package (the sanctioned
@@ -707,23 +707,23 @@ def test_reference_agreement_coverage():
 
 
 # ===========================================================================
-# ECAPE reference oracle -- gated on the optional ECAPE_FUNCTIONS package
+# ECAPE reference oracle -- gated on the optional ecape-parcel-py package
 # ===========================================================================
 
 def test_ecape_matches_reference_oracle():
     """ECAPE agrees with the ECAPE authors' reference implementation.
 
-    Uses the ECAPE authors' ``ECAPE_FUNCTIONS`` (the ``ecape`` PyPI package,
-    ``calc_ecape``) as the reference oracle over the documented test-sounding
-    set. Gated with ``pytest.importorskip("ecape")`` -- when the reference
+    Uses ``ecape-parcel-py`` (``ecape_parcel.ecape_calc.calc_ecape``) as the
+    reference oracle over the documented test-sounding set. Gated with
+    ``pytest.importorskip("ecape_parcel")`` -- when the reference
     package is unavailable in the environment this test is *skipped*, not failed.
 
     Feature: sharppy-modernization, Property 10: Every derived parameter agrees
     with its reference implementation
     Validates: Requirements 5.1, 5.2, 5.7
     """
-    pytest.importorskip("ecape")
-    from ecape.calc import calc_ecape  # type: ignore
+    pytest.importorskip("ecape_parcel")
+    from ecape_parcel.ecape_calc import calc_ecape  # type: ignore
 
     abs_tol = PARAM_REGISTRY["ecape"].tolerance
     rel = RELATIVE_TOLERANCE.get("ecape", 0.0)
@@ -751,9 +751,9 @@ def test_ecape_matches_reference_oracle():
 
 
 def _ecape_reference(snd, calc_ecape):
-    """Compute reference ECAPE (J/kg) via the ``ecape`` package, or ``None``.
+    """Compute reference ECAPE (J/kg) via ``ecape-parcel-py``, or ``None``.
 
-    The ``ecape`` package's ``calc_ecape`` expects height (m), pressure (Pa),
+    ``ecape-parcel-py``'s ``calc_ecape`` expects height (m), pressure,
     temperature (K), specific humidity (kg/kg), and wind components (m/s) as
     ``pint`` quantities. Any failure or missing dependency yields ``None`` so the
     caller simply skips that sounding rather than failing spuriously.

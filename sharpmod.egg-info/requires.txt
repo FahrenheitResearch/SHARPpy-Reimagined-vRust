@@ -5,7 +5,7 @@ python-dateutil<3.0,>=2.8
 certifi>=2023.7.22
 requests<3.0,>=2.28
 metpy<2.0,>=1.5
-ecape<1.0,>=0.1
+ecape-parcel<2.0,>=1.2.2
 
 [dev]
 pytest>=7.0

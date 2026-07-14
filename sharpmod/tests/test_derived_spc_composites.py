@@ -89,3 +89,20 @@ def test_derived_profile_preserves_omega_wetbulb_and_metadata():
     assert sm_prof.meta["lat"] == pytest.approx(35.0)
     assert sm_prof.meta["lon"] == pytest.approx(-97.0)
     assert sm_prof.meta["surface_relative_vorticity"] == pytest.approx(8.0e-5)
+
+
+def test_derived_profile_bridge_reuses_cached_companion():
+    prof = SimpleNamespace(
+        pres=np.array([1000.0, 900.0, 800.0]),
+        hght=np.array([100.0, 1000.0, 2000.0]),
+        tmpc=np.array([25.0, 18.0, 10.0]),
+        dwpc=np.array([20.0, 15.0, 5.0]),
+        wdir=np.array([180.0, 200.0, 220.0]),
+        wspd=np.array([10.0, 20.0, 30.0]),
+    )
+
+    first = _derived_profile(prof)
+    second = _derived_profile(prof)
+
+    assert second is first
+    assert prof._sharpmod_derived_profile is first

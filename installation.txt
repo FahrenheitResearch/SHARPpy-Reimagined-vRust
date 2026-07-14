@@ -5,7 +5,7 @@ python-dateutil<3.0,>=2.8
 certifi>=2023.7.22
 requests<3.0,>=2.28
 metpy<2.0,>=1.5
-ecape<1.0,>=0.1
+ecape-parcel<2.0,>=1.2.2
 
 [dev]
 pytest>=7.0
@@ -50,24 +50,33 @@ and the pip distribution name); "SHARPpy Reimagined" is the project name.
 ---------------------------------------------------------------------------
 2. QUICK INSTALL (copy/paste)
 ---------------------------------------------------------------------------
-  # 1) core library + CLI tools + render transitive deps
-  pip install -e ".[render]"
+  # 1) start from a repository checkout
+  git clone https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust.git
+  cd SHARPpy-Reimagined-vRust
 
-  # 2) rendering engine (separate step — see section 4 for why)
-  pip install --no-deps "SHARPpy==1.4.0a5"
+  # 2) create and activate an isolated environment
+  python -m venv .venv
+  # Windows PowerShell: .venv\Scripts\Activate.ps1
+  # macOS/Linux:       source .venv/bin/activate
 
-  # 3) optional, only if you need them
-  pip install -e ".[era5]"     # ERA5 point-sounding extraction
-  pip install -e ".[wrf]"      # WRF-ARW (wrfout NetCDF) extraction
-  pip install -e ".[dev]"      # run the test suite
+  python -m pip install --upgrade pip setuptools wheel
 
-  On Windows, create/activate a venv first:
-      py -3.11 -m venv .venv
-      .venv\Scripts\activate
+  # 3) core library + CLI tools + render transitive deps
+  python -m pip install ".[render]"
 
+  # 4) rendering engine (separate step -- see section 4 for why)
+  python -m pip install --no-deps "SHARPpy==1.4.0a5"
+
+  # 5) verify the packages needed by the GUI/renderer
+  python -c "import sharpmod, sharppy, sutils, PySide6, qtpy; print('imports OK')"
+
+  # 6) optional extras; use -e only when developing this checkout
+  python -m pip install ".[era5]"     # ERA5 point-sounding extraction
+  python -m pip install ".[wrf]"      # WRF-ARW (wrfout NetCDF) extraction
+  python -m pip install -e ".[dev]"   # run/edit the test suite
 
 ---------------------------------------------------------------------------
-3. CORE RUNTIME LIBRARIES  (installed by `pip install -e .`)
+3. CORE RUNTIME LIBRARIES  (installed by `pip install .` or `pip install -e .`)
 ---------------------------------------------------------------------------
   Package           Version pin       Purpose
   ----------------  ---------------   -------------------------------------
@@ -78,7 +87,7 @@ and the pip distribution name); "SHARPpy Reimagined" is the project name.
   certifi           >=2023.7.22       CA bundle for verified HTTPS fetches
   requests          >=2.28,<3.0       HTTP (UWyo + SHARPpy datasources)
   metpy             >=1.5,<2.0        meteorological calcs (ECAPE reference)
-  ecape             >=0.1,<1.0        entraining CAPE implementation
+  ecape-parcel      >=1.2.2,<2.0      analytic ECAPE fallback/reference
 
   Notable second-level libraries pulled in automatically (mainly by MetPy
   and PySide6), listed for offline mirrors / air-gapped installs:
