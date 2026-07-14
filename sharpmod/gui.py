@@ -85,7 +85,7 @@ _uwyo_catalog_mod = None
 _uwyo_decoder_types = None
 
 APP_NAME = "SHARPpy Reimagined vRust"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 UNIT_DEFAULTS = {
     "temp_units": "Fahrenheit",

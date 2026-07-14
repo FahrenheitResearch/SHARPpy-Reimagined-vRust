@@ -2145,7 +2145,7 @@ def enlarge_canvas(win):
         pass
 
 
-def rebrand_version_label(win, text="SHARPpy Reimagined vRust v0.2.0"):
+def rebrand_version_label(win, text="SHARPpy Reimagined vRust v0.2.1"):
     """Rename the vendored top-right ``SHARPpy v...`` label to the fork's brand.
 
     Returns the label widget (or ``None``) so callers can align it. Guarded so a

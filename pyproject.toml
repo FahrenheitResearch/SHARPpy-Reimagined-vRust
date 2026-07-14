@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sharpmod"
-version = "0.2.0"
+version = "0.2.1"
 description = "SHARPpy Reimagined vRust: Rust-accelerated model soundings and analytic ECAPE with a Qt6 SHARPpy-style GUI."
 readme = "README.md"
 requires-python = ">=3.11"

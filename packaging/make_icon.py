@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the SHARPpy Reimagined application logo / Windows icon.
+"""Generate the SHARPpy Reimagined application logo and platform icons.
 
 Authentic-retro pixel art: the whole mark is hand-placed on a small 32x32
 grid and blown up with nearest-neighbour scaling, so it keeps the crisp,
@@ -10,6 +10,7 @@ trace and a green dewpoint trace stepping up-and-to-the-left over a dark plot.
 Flat solid colours, no anti-aliasing, no gradients. Emitted as:
 
 * ``sharpmod/resources/icons/app.ico``  -- multi-resolution Windows icon
+* ``sharpmod/resources/icons/app.icns`` -- multi-resolution macOS icon
 * ``sharpmod/resources/icons/app.png``  -- 512 px preview / general-purpose PNG
 
 Run from the repository root::
@@ -138,8 +139,12 @@ def main() -> None:
     frames[0].save(ico_path, format="ICO",
                    sizes=[(n, n) for n in sizes], append_images=frames[1:])
 
+    icns_path = os.path.join(out_dir, "app.icns")
+    logo.save(icns_path, format="ICNS")
+
     print(f"wrote {png_path}")
     print(f"wrote {ico_path}  ({', '.join(f'{n}x{n}' for n in sizes)})")
+    print(f"wrote {icns_path}")
 
 
 if __name__ == "__main__":

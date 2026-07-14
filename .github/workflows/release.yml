@@ -7,22 +7,85 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v0.1.0). Created if it does not exist."
+        description: "Release tag to publish (for example v0.2.1)"
         required: true
-        default: "v0.1.0"
+        default: "v0.2.1"
 
 permissions:
   contents: write
 
+env:
+  APP_NAME: SHARPpy-Reimagined-vRust
+  RUSTY_WEATHER_REV: 7c3db1bf25e5d37b751b168c9510b48579d59d83
+
 jobs:
-  build-windows-exe:
-    name: Build Windows executable
+  release-meta:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v7
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate tag matches package version
+        shell: bash
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          tag="${{ steps.tag.outputs.tag }}"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::Release tag $tag does not match package version $version"
+            exit 1
+          fi
+
+  build-windows:
+    name: Windows x64
+    needs: release-meta
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      - name: Check out repository
+      - name: Check out SHARPpy Reimagined
         uses: actions/checkout@v7
+
+      - name: Check out pinned Rusty Weather
+        uses: actions/checkout@v7
+        with:
+          repository: FahrenheitResearch/rusty-weather
+          ref: ${{ env.RUSTY_WEATHER_REV }}
+          path: native/rusty-weather
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native helpers
+        run: >-
+          cargo build --release --locked
+          --manifest-path native/rusty-weather/Cargo.toml
+          -p rusty-weather
+          --bin rw_ingest
+          --bin rw_sharpmod
+          --bin rw_ecape_analytic
+
+      - name: Install native helpers
+        shell: pwsh
+        run: |
+          $source = "native/rusty-weather/target/release"
+          $dest = "sharpmod/resources/bin"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item "$source/rw_ingest.exe" "$dest/rw_ingest.exe" -Force
+          Copy-Item "$source/rw_sharpmod.exe" "$dest/rw_sharpmod.exe" -Force
+          Copy-Item "$source/rw_ecape_analytic.exe" "$dest/rw_ecape_analytic.exe" -Force
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -35,30 +98,31 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[render,era5]"
           python -m pip install --no-deps "SHARPpy==1.4.0a5"
-          python -m pip install pyinstaller
+          python -m pip install pyinstaller pillow
 
-      - name: Generate application icon
+      - name: Generate application icons
         run: python packaging/make_icon.py
-        continue-on-error: true
 
       - name: Build one-folder executable
         run: pyinstaller packaging/sharpmod_gui.spec --noconfirm
 
-      - name: Verify frozen model-fetch runtime
+      - name: Verify frozen runtime
         shell: pwsh
         run: |
           $report = Join-Path $env:RUNNER_TEMP "model-fetch-runtime.json"
           $process = Start-Process `
-            -FilePath "dist/SHARPpy-Reimagined-vRust/SHARPpy-Reimagined-vRust.exe" `
+            -FilePath "dist/$env:APP_NAME/$env:APP_NAME.exe" `
             -ArgumentList "--model-fetch-runtime-check", $report `
             -Wait -PassThru
           if ($process.ExitCode -ne 0) {
             if (Test-Path $report) { Get-Content $report }
-            throw "Frozen model-fetch runtime check failed"
+            throw "Frozen runtime check failed"
           }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or $result.configured_models -lt 1) {
-            throw "Frozen model-fetch runtime report is invalid"
+          if (-not $result.ok -or -not $result.native_ecape -or `
+              -not $result.rusty_weather -or $result.configured_models -lt 1) {
+            $result | ConvertTo-Json
+            throw "Frozen runtime report is invalid"
           }
           $result | ConvertTo-Json
 
@@ -67,42 +131,281 @@ jobs:
           SHARPMOD_ONEFILE: "1"
         run: pyinstaller packaging/sharpmod_gui.spec --noconfirm
 
-      - name: Resolve release tag
-        id: tag
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Package one-folder build as zip
+      - name: Package Windows builds
         shell: pwsh
         run: |
-          $tag = "${{ steps.tag.outputs.tag }}"
-          Compress-Archive -Path "dist/SHARPpy-Reimagined-vRust/*" `
-            -DestinationPath "dist/SHARPpy-Reimagined-vRust-$tag-windows-x64.zip" -Force
-          Copy-Item "dist/SHARPpy-Reimagined-vRust.exe" `
-            "dist/SHARPpy-Reimagined-vRust-$tag-windows-x64.exe" -Force
+          $tag = "${{ needs.release-meta.outputs.tag }}"
+          Compress-Archive -Path "dist/$env:APP_NAME/*" `
+            -DestinationPath "dist/$env:APP_NAME-$tag-windows-x64.zip" -Force
+          Copy-Item "dist/$env:APP_NAME.exe" `
+            "dist/$env:APP_NAME-$tag-windows-x64.exe" -Force
+          foreach ($file in @(
+            "dist/$env:APP_NAME-$tag-windows-x64.zip",
+            "dist/$env:APP_NAME-$tag-windows-x64.exe"
+          )) {
+            $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant()
+            "$hash *$(Split-Path $file -Leaf)" | Set-Content -Encoding ascii "$file.sha256"
+          }
 
-      - name: Upload build artifacts
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: windows-build
+          name: release-windows-x64
+          if-no-files-found: error
           path: |
             dist/SHARPpy-Reimagined-vRust-*-windows-x64.zip
             dist/SHARPpy-Reimagined-vRust-*-windows-x64.exe
+            dist/SHARPpy-Reimagined-vRust-*-windows-x64.*.sha256
+
+  build-linux:
+    name: Linux x64
+    needs: release-meta
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out SHARPpy Reimagined
+        uses: actions/checkout@v7
+
+      - name: Check out pinned Rusty Weather
+        uses: actions/checkout@v7
+        with:
+          repository: FahrenheitResearch/rusty-weather
+          ref: ${{ env.RUSTY_WEATHER_REV }}
+          path: native/rusty-weather
+
+      - name: Install Linux runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libdbus-1-3 \
+            libegl1 \
+            libgl1 \
+            libglib2.0-0 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-xinerama0 \
+            libxcb-xinput0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native helpers
+        run: >-
+          cargo build --release --locked
+          --manifest-path native/rusty-weather/Cargo.toml
+          -p rusty-weather
+          --bin rw_ingest
+          --bin rw_sharpmod
+          --bin rw_ecape_analytic
+
+      - name: Install native helpers
+        run: |
+          install -m 755 native/rusty-weather/target/release/rw_ingest sharpmod/resources/bin/rw_ingest
+          install -m 755 native/rusty-weather/target/release/rw_sharpmod sharpmod/resources/bin/rw_sharpmod
+          install -m 755 native/rusty-weather/target/release/rw_ecape_analytic sharpmod/resources/bin/rw_ecape_analytic
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[render,era5]"
+          python -m pip install --no-deps "SHARPpy==1.4.0a5"
+          python -m pip install pyinstaller pillow
+
+      - name: Generate application icons
+        run: python packaging/make_icon.py
+
+      - name: Build one-folder executable
+        run: >-
+          pyinstaller packaging/sharpmod_gui.spec --noconfirm
+          --distpath dist/onefolder --workpath build/onefolder
+
+      - name: Verify frozen runtime
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          report="$RUNNER_TEMP/model-fetch-runtime.json"
+          "dist/onefolder/$APP_NAME/$APP_NAME" --model-fetch-runtime-check "$report"
+          python - "$report" <<'PY'
+          import json, sys
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert result["ok"]
+          assert result["native_ecape"]
+          assert result["rusty_weather"]
+          assert result["configured_models"] >= 1
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Build single-file executable
+        env:
+          SHARPMOD_ONEFILE: "1"
+        run: >-
+          pyinstaller packaging/sharpmod_gui.spec --noconfirm
+          --distpath dist/onefile --workpath build/onefile
+
+      - name: Package Linux builds
+        run: |
+          tag="${{ needs.release-meta.outputs.tag }}"
+          tar -C dist/onefolder -czf "dist/$APP_NAME-$tag-linux-x64.tar.gz" "$APP_NAME"
+          install -m 755 "dist/onefile/$APP_NAME" "dist/$APP_NAME-$tag-linux-x64"
+          (
+            cd dist
+            sha256sum "$APP_NAME-$tag-linux-x64.tar.gz" > "$APP_NAME-$tag-linux-x64.tar.gz.sha256"
+            sha256sum "$APP_NAME-$tag-linux-x64" > "$APP_NAME-$tag-linux-x64.sha256"
+          )
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-linux-x64
+          if-no-files-found: error
+          path: |
+            dist/SHARPpy-Reimagined-vRust-*-linux-x64.tar.gz
+            dist/SHARPpy-Reimagined-vRust-*-linux-x64
+            dist/SHARPpy-Reimagined-vRust-*-linux-x64*.sha256
+
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    needs: release-meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+
+    steps:
+      - name: Check out SHARPpy Reimagined
+        uses: actions/checkout@v7
+
+      - name: Check out pinned Rusty Weather
+        uses: actions/checkout@v7
+        with:
+          repository: FahrenheitResearch/rusty-weather
+          ref: ${{ env.RUSTY_WEATHER_REV }}
+          path: native/rusty-weather
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native helpers
+        run: >-
+          cargo build --release --locked
+          --manifest-path native/rusty-weather/Cargo.toml
+          -p rusty-weather
+          --bin rw_ingest
+          --bin rw_sharpmod
+          --bin rw_ecape_analytic
+
+      - name: Install native helpers
+        run: |
+          install -m 755 native/rusty-weather/target/release/rw_ingest sharpmod/resources/bin/rw_ingest
+          install -m 755 native/rusty-weather/target/release/rw_sharpmod sharpmod/resources/bin/rw_sharpmod
+          install -m 755 native/rusty-weather/target/release/rw_ecape_analytic sharpmod/resources/bin/rw_ecape_analytic
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[render,era5]"
+          python -m pip install --no-deps "SHARPpy==1.4.0a5"
+          python -m pip install pyinstaller pillow
+
+      - name: Generate application icons
+        run: python packaging/make_icon.py
+
+      - name: Build macOS application bundle
+        run: pyinstaller packaging/sharpmod_gui.spec --noconfirm
+
+      - name: Verify frozen runtime
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          report="$RUNNER_TEMP/model-fetch-runtime.json"
+          "dist/$APP_NAME.app/Contents/MacOS/$APP_NAME" --model-fetch-runtime-check "$report"
+          python - "$report" <<'PY'
+          import json, sys
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert result["ok"]
+          assert result["native_ecape"]
+          assert result["rusty_weather"]
+          assert result["configured_models"] >= 1
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Ad-hoc sign application bundle
+        run: codesign --force --deep --sign - "dist/$APP_NAME.app"
+
+      - name: Package macOS application
+        run: |
+          tag="${{ needs.release-meta.outputs.tag }}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/$APP_NAME.app" \
+            "dist/$APP_NAME-$tag-macos-${{ matrix.arch }}.app.zip"
+          (
+            cd dist
+            shasum -a 256 "$APP_NAME-$tag-macos-${{ matrix.arch }}.app.zip" \
+              > "$APP_NAME-$tag-macos-${{ matrix.arch }}.app.zip.sha256"
+          )
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            dist/SHARPpy-Reimagined-vRust-*-macos-${{ matrix.arch }}.app.zip
+            dist/SHARPpy-Reimagined-vRust-*-macos-${{ matrix.arch }}.app.zip.sha256
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - release-meta
+      - build-windows
+      - build-linux
+      - build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release payload
+        run: find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: SHARPpy Reimagined vRust ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.release-meta.outputs.tag }}
+          name: SHARPpy Reimagined vRust ${{ needs.release-meta.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            dist/SHARPpy-Reimagined-vRust-*-windows-x64.zip
-            dist/SHARPpy-Reimagined-vRust-*-windows-x64.exe
+          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: sharpmod
-Version: 0.2.0
+Version: 0.2.1
 Summary: SHARPpy Reimagined vRust: Rust-accelerated model soundings and analytic ECAPE with a Qt6 SHARPpy-style GUI.
 Author: SHARPpy Reimagined maintainers
 License: BSD-3-Clause

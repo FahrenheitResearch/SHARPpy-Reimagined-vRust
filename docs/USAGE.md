@@ -143,16 +143,17 @@ The sounding window's **Export** menu writes the current view:
 
 ### Standalone build (no Python required)
 
-For a distributable Windows build, use the bundled PyInstaller spec:
+For a distributable build on the current operating system, use the bundled
+PyInstaller spec:
 
 ```bash
 python -m pip install pyinstaller
 pyinstaller packaging/sharpmod_gui.spec --noconfirm
 ```
 
-The result is
-`dist/SHARPpy-Reimagined-vRust/SHARPpy-Reimagined-vRust.exe`. See the README
-for the one-file variant.
+The result is a one-folder app on Windows/Linux or a `.app` bundle on macOS.
+See the README for release downloads and the Windows/Linux one-file variant.
+PyInstaller must run separately on each target operating system.
 
 ---
 

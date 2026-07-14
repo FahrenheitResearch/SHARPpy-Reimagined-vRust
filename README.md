@@ -20,13 +20,19 @@ It keeps the familiar SPC-style skew-T, hodograph, hazard, and derived-parameter
 views while adding clean command-line entry points, bundled resources, and a
 test-backed decoder/extractor layer.
 
-## Download for Windows
+## Download
 
 The [latest GitHub release](https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust/releases/latest)
-provides both a single `SHARPpy-Reimagined-vRust-*-windows-x64.exe` and a
-portable one-folder `.zip`. Neither requires Python. Download the EXE and run
-it directly; use the ZIP if antivirus or startup performance makes the
-self-extracting build inconvenient.
+provides no-Python-required desktop builds for:
+
+- **Windows x64:** a single `.exe` and a portable one-folder `.zip`.
+- **Linux x64:** a single executable and a portable one-folder `.tar.gz`.
+- **macOS Apple Silicon and Intel:** zipped `.app` bundles.
+
+On macOS these community builds are ad-hoc signed, not Apple-notarized; use
+**Control-click → Open** the first time if Gatekeeper asks for confirmation.
+On Linux, extract the archive and run `SHARPpy-Reimagined-vRust` (or make the
+single-file download executable with `chmod +x` first).
 
 ## Highlights
 
@@ -122,7 +128,7 @@ The sounding window's **Export** menu saves the current view:
 
 (The upstream `File → Save Image` / `Save Text` actions remain available too.)
 
-### Standalone executable (Windows)
+### Standalone application
 
 A one-folder, no-Python-required build is produced with PyInstaller:
 
@@ -131,9 +137,11 @@ python -m pip install pyinstaller
 pyinstaller packaging/sharpmod_gui.spec --noconfirm
 ```
 
-The result is
-`dist/SHARPpy-Reimagined-vRust/SHARPpy-Reimagined-vRust.exe`. Set
-`SHARPMOD_ONEFILE=1` for a single self-extracting `.exe` instead.
+The result is `dist/SHARPpy-Reimagined-vRust/` on Windows/Linux and a
+`dist/SHARPpy-Reimagined-vRust.app` bundle on macOS. Set
+`SHARPMOD_ONEFILE=1` on Windows or Linux for a single self-extracting
+executable instead. PyInstaller outputs are platform-specific, so each build
+must be created on its target operating system.
 
 ## Command Line Tools
 

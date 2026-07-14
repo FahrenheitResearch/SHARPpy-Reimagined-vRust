@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import multiprocessing
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,10 +32,32 @@ def _model_fetch_runtime_check(output_path: str) -> int:
         from sharpmod.tools import model_extract
         from sharpmod.tools import rusty_weather
 
-        if not native_ecape.available():
-            raise RuntimeError("bundled rw_ecape_analytic executable is missing")
-        if not rusty_weather.is_available("hrrr"):
-            raise RuntimeError("bundled Rusty Weather model executables are missing")
+        native_ecape_available = native_ecape.available()
+        rusty_weather_available = rusty_weather.is_available("hrrr")
+        configured_models = len(model_extract.available_models())
+        if configured_models < 1:
+            raise RuntimeError("no model-fetch backend is configured")
+        native_ecape_probe = None
+        if native_ecape_available:
+            native_ecape_probe = native_ecape.analytic_ecape(
+                [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200],
+                [100, 800, 1500, 3000, 4200, 5600, 7200, 9200, 10500, 12000],
+                [30, 24, 18, 6, -2, -12, -24, -40, -49, -58],
+                [22, 18, 12, 0, -8, -18, -32, -45, -55, -65],
+                [5, 8, 12, 18, 22, 28, 34, 40, 44, 48],
+                [2, 5, 8, 12, 16, 20, 24, 28, 32, 35],
+                timeout=30,
+            )
+            if native_ecape_probe is None:
+                raise RuntimeError("bundled native ECAPE helper failed its protocol probe")
+        if rusty_weather_available:
+            for executable in rusty_weather.find_binaries():
+                subprocess.run(
+                    [executable, "--help"],
+                    capture_output=True,
+                    check=True,
+                    timeout=30,
+                )
 
         result.update(
             cfgrib=cfgrib.__version__,
@@ -42,9 +65,12 @@ def _model_fetch_runtime_check(output_path: str) -> int:
             eccodes=eccodes.codes_get_api_version(),
             herbie=herbie.__version__,
             xarray=xarray.__version__,
-            configured_models=len(model_extract.available_models()),
-            native_ecape=True,
-            rusty_weather=True,
+            configured_models=configured_models,
+            native_ecape=native_ecape_available,
+            native_ecape_probe=native_ecape_probe is not None,
+            rusty_weather=rusty_weather_available,
+            ecape_fallback=not native_ecape_available,
+            model_fetch_fallback=not rusty_weather_available,
             ok=True,
         )
     except BaseException as exc:  # noqa: BLE001 - diagnostics must be recorded
