@@ -19,9 +19,12 @@ from sharppy.sharptab import constants as sp_constants
 from sharppy.sharptab import interp as sp_interp
 from sharppy.sharptab import params as sp_params
 from sharppy.sharptab import profile as sp_profile
+from sharppy.sharptab import thermo as sp_thermo
 from sharppy.sharptab import utils as sp_utils
+from sharppy.sharptab import watch_type as sp_watch_type
+from sharppy.sharptab import winds as sp_winds
 
-from . import native_analysis
+from . import native_analysis, sars_cache
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,18 +99,14 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
         )
 
     def _run_python_only_features(self):
-        # These calls are intentionally explicit. Each supplies data or a
-        # database that the pinned Rust API does not currently accept.
-        sp_profile.ConvectiveProfile.get_fire(self)
-        self._apply_native_fire(self._sharpmod_native_analysis)
-
-        sp_profile.ConvectiveProfile.get_precip(self)
-        self._apply_native_winter(self._sharpmod_native_analysis)
+        # Calculate only the fields that the pinned Rust API does not supply.
+        # The vendored methods also recompute native fire, winter, SHIP, and
+        # parcel values, which are immediately overwritten and cost tens of
+        # milliseconds on every cached map click.
+        self._run_python_fire_details()
+        self._run_python_precip_details()
         self._apply_native_precip_type()
-
-        sp_profile.ConvectiveProfile.get_sars(self)
-        self.ship = _masked_scalar(
-            self._sharpmod_native_analysis["derived"]["ship"])
+        self._run_python_sars_matches()
 
         try:
             sp_profile.ConvectiveProfile.get_PWV_loc(self)
@@ -115,6 +114,103 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
             _LOGGER.warning("PWV climatology unavailable: %s", exc)
             self.pwv_flag = 0
         self._apply_native_watch()
+
+    def _run_python_fire_details(self):
+        """Populate the PBL fields not yet exposed by sharprs."""
+        self.ppbl_top = sp_params.pbl_top(self)
+        self.sfc_rh = sp_thermo.relh(
+            self.pres[self.sfc], self.tmpc[self.sfc], self.dwpc[self.sfc])
+        pres_sfc = self.pres[self.sfc]
+        pres_1km = sp_interp.pres(self, sp_interp.to_msl(self, 1000.0))
+        self.pbl_h = sp_interp.to_agl(
+            self, sp_interp.hght(self, self.ppbl_top))
+        self.rh01km = sp_params.mean_relh(
+            self, pbot=pres_sfc, ptop=pres_1km)
+        self.pblrh = sp_params.mean_relh(
+            self, pbot=pres_sfc, ptop=self.ppbl_top)
+        self.meanwind01km = sp_winds.mean_wind(
+            self, pbot=pres_sfc, ptop=pres_1km)
+        self.meanwindpbl = sp_winds.mean_wind(
+            self, pbot=pres_sfc, ptop=self.ppbl_top)
+        self.pblmaxwind = sp_winds.max_wind(
+            self, lower=0, upper=self.pbl_h)
+
+    def _run_python_precip_details(self):
+        """Populate precip-source and warm/cold-layer fields absent in Rust."""
+        # Preserve the established mean-omega result by using the vendored DGZ
+        # bounds; all displayed DGZ thermodynamic values remain native.
+        dgz_pbot, dgz_ptop = sp_params.dgz(self)
+        self.dgz_meanomeg = sp_params.mean_omega(
+            self, pbot=dgz_pbot, ptop=dgz_ptop) * 10
+        self.oprh = self.dgz_meanomeg * self.dgz_pw * (
+            self.dgz_meanrh / 100.0)
+
+        self.plevel, self.phase, self.tmp, self.st = \
+            sp_watch_type.init_phase(self)
+        self.tpos, self.tneg, self.ttop, self.tbot = \
+            sp_watch_type.posneg_temperature(self, start=self.plevel)
+        self.wpos, self.wneg, self.wtop, self.wbot = \
+            sp_watch_type.posneg_wetbulb(self, start=self.plevel)
+        self.precip_type = sp_watch_type.best_guess_precip(
+            self, self.phase, self.plevel, self.tmp, self.tpos, self.tneg)
+
+    def _run_python_sars_matches(self):
+        """Populate analog matches while reusing parsed immutable databases."""
+        sfc_6km_shear = sp_utils.KTS2MS(sp_utils.mag(
+            self.sfc_6km_shear[0], self.sfc_6km_shear[1]))
+        sfc_3km_shear = sp_utils.KTS2MS(sp_utils.mag(
+            self.sfc_3km_shear[0], self.sfc_3km_shear[1]))
+        sfc_9km_shear = sp_utils.KTS2MS(sp_utils.mag(
+            self.sfc_9km_shear[0], self.sfc_9km_shear[1]))
+        h500t = sp_interp.temp(self, 500.0)
+        lapse_rate = sp_params.lapse_rate(self, 700.0, 500.0, pres=True)
+        mumr = sp_thermo.mixratio(self.mupcl.pres, self.mupcl.dwpc)
+
+        self.hail_database = "sars_hail.txt"
+        self.supercell_database = "sars_supercell.txt"
+        hail_args = (
+            mumr, self.mupcl.bplus, h500t, lapse_rate, sfc_6km_shear,
+            sfc_9km_shear, sfc_3km_shear)
+        supercell_args = (
+            self.mlpcl.bplus, self.mlpcl.lclhght, h500t, lapse_rate,
+            sp_utils.MS2KTS(sfc_6km_shear))
+
+        try:
+            self.right_matches = sars_cache.hail(
+                self.hail_database, *hail_args, self.right_srh3km[0])
+        except Exception:
+            self.right_matches = ([], [], 0, 0, 0)
+        try:
+            self.left_matches = sars_cache.hail(
+                self.hail_database, *hail_args, -self.left_srh3km[0])
+        except Exception:
+            self.left_matches = ([], [], 0, 0, 0)
+
+        common_supercell = (
+            sp_utils.MS2KTS(sfc_3km_shear),
+            sp_utils.MS2KTS(sfc_9km_shear),
+        )
+        try:
+            self.right_supercell_matches = sars_cache.supercell(
+                self.supercell_database, *supercell_args,
+                self.right_srh1km[0], *common_supercell,
+                self.right_srh3km[0])
+        except Exception:
+            self.right_supercell_matches = ([], [], 0, 0, 0)
+        try:
+            self.left_supercell_matches = sars_cache.supercell(
+                self.supercell_database, *supercell_args,
+                -self.left_srh1km[0], *common_supercell,
+                -self.left_srh3km[0])
+        except Exception:
+            self.left_supercell_matches = ([], [], 0, 0, 0)
+
+        if self.latitude < 0:
+            self.supercell_matches = self.left_supercell_matches
+            self.matches = self.left_matches
+        else:
+            self.supercell_matches = self.right_supercell_matches
+            self.matches = self.right_matches
 
     def _apply_native(self, native, *, reset_bunkers=False):
         arrays = native["arrays"]

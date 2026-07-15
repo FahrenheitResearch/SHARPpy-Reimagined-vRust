@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -58,6 +59,155 @@ def test_json_bridge_rejects_non_descending_pressure(tmp_path):
 
     with pytest.raises(model_extract.RetrievalError, match="strictly descending"):
         rusty_weather.json_to_npz(bridge, tmp_path / "bad.npz")
+
+
+def test_cached_point_prefers_persistent_exporter(monkeypatch, tmp_path):
+    run = datetime(2026, 7, 13, 22, tzinfo=timezone.utc)
+    output = tmp_path / "point.npz"
+    calls = []
+
+    def persistent(
+            exporter, cache_root, model, run_time, fxx, lat, lon,
+            bridge_path, cancelled=None):
+        calls.append((
+            exporter, cache_root, model, run_time, fxx, lat, lon,
+            cancelled))
+        Path(bridge_path).write_text(json.dumps(_payload()), encoding="utf-8")
+
+    monkeypatch.setattr(rusty_weather._POINT_SERVER, "export", persistent)
+    monkeypatch.setattr(
+        rusty_weather, "_run_command",
+        lambda *_args, **_kwargs: pytest.fail("one-shot fallback was used"))
+
+    path, resolved = rusty_weather._export_cached_point(
+        "rw_sharpmod", tmp_path, "hrrr", run, 1, 35.2, -97.4,
+        output, label="HRRR")
+
+    assert path == str(output)
+    assert resolved == run
+    assert calls == [(
+        "rw_sharpmod", tmp_path, "hrrr", run, 1, 35.2, -97.4,
+        None)]
+
+
+def test_cached_point_falls_back_for_legacy_exporter(monkeypatch, tmp_path):
+    run = datetime(2026, 7, 13, 22, tzinfo=timezone.utc)
+    output = tmp_path / "fallback.npz"
+    disabled = []
+    commands = []
+
+    monkeypatch.setattr(
+        rusty_weather._POINT_SERVER, "export",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            rusty_weather._PointServerTransportError("no server mode")))
+    monkeypatch.setattr(
+        rusty_weather._POINT_SERVER, "disable",
+        lambda exporter: disabled.append(exporter))
+
+    def one_shot(command, _description, cancelled=None):
+        commands.append((command, cancelled))
+        bridge_path = Path(command[command.index("--output") + 1])
+        bridge_path.write_text(json.dumps(_payload()), encoding="utf-8")
+
+    monkeypatch.setattr(rusty_weather, "_run_command", one_shot)
+
+    path, resolved = rusty_weather._export_cached_point(
+        "legacy_rw_sharpmod", tmp_path, "hrrr", run, 1, 35.2, -97.4,
+        output, label="HRRR")
+
+    assert path == str(output)
+    assert resolved == run
+    assert disabled == ["legacy_rw_sharpmod"]
+    assert commands[0][0][0] == "legacy_rw_sharpmod"
+
+
+class _FakePipe:
+    def __init__(self):
+        self.text = ""
+        self.closed = False
+
+    def write(self, value):
+        self.text += value
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _HungProcess:
+    def __init__(self):
+        self.stdin = _FakePipe()
+        self.stdout = _FakePipe()
+        self.stderr = _FakePipe()
+        self.stopped = False
+
+    def poll(self):
+        return 0 if self.stopped else None
+
+    def wait(self, timeout=None):
+        self.stopped = True
+        return 0
+
+    def terminate(self):
+        self.stopped = True
+
+    def kill(self):
+        self.stopped = True
+
+
+def _install_hung_server(monkeypatch, server, process, tmp_path):
+    def start(exporter):
+        server._process = process
+        server._exporter = server._key(exporter)
+        server._responses = rusty_weather.queue.Queue()
+        server._errors = rusty_weather.deque(maxlen=40)
+
+    monkeypatch.setattr(server, "_start_locked", start)
+    return dict(
+        exporter=tmp_path / "rw_sharpmod",
+        cache_root=tmp_path,
+        model="hrrr",
+        run_time=datetime(2026, 7, 13, 22, tzinfo=timezone.utc),
+        fxx=1,
+        lat=35.2,
+        lon=-97.4,
+        output=tmp_path / "bridge.json",
+    )
+
+
+def test_persistent_exporter_has_bounded_request_deadline(
+        monkeypatch, tmp_path):
+    server = rusty_weather._RustPointServer()
+    process = _HungProcess()
+    request = _install_hung_server(
+        monkeypatch, server, process, tmp_path)
+    monkeypatch.setattr(
+        rusty_weather, "_POINT_SERVER_REQUEST_TIMEOUT", 0.01)
+
+    with pytest.raises(
+            rusty_weather._PointServerTransportError, match="timed out"):
+        server.export(**request)
+
+    assert process.stopped
+
+
+def test_persistent_exporter_cancellation_stops_hung_helper(
+        monkeypatch, tmp_path):
+    from sharpmod.model_transport import DownloadCancelled
+
+    server = rusty_weather._RustPointServer()
+    process = _HungProcess()
+    request = _install_hung_server(
+        monkeypatch, server, process, tmp_path)
+    checks = iter((False, True))
+    request["cancelled"] = lambda: next(checks, True)
+
+    with pytest.raises(DownloadCancelled, match="cancelled"):
+        server.export(**request)
+
+    assert process.stopped
 
 
 def test_explicit_rust_backend_reports_missing_binaries(monkeypatch):
@@ -154,6 +304,13 @@ def test_cache_hour_builds_durable_rws_without_exporting_point(
         rusty_weather, "find_binaries",
         lambda: ("rw_ingest", "rw_sharpmod"))
     monkeypatch.setattr(rusty_weather, "_ensure_hour", ensure_hour)
+    stopped = []
+    warmed = []
+    monkeypatch.setattr(
+        rusty_weather._POINT_SERVER, "stop", lambda: stopped.append(True))
+    monkeypatch.setattr(
+        rusty_weather._POINT_SERVER, "warm",
+        lambda *args, **kwargs: warmed.append((args, kwargs)))
 
     result = rusty_weather.cache_hour(
         "hrrr", run, 4, cache_root=tmp_path,
@@ -165,6 +322,11 @@ def test_cache_hour_builds_durable_rws_without_exporting_point(
     assert not raw.exists()
     assert events[-1] == (
         "Model hour ready for fast map browsing", 100)
+    assert stopped == [True]
+    assert warmed == [((
+        "rw_sharpmod", tmp_path, "hrrr", run, 4), {
+            "cancelled": None,
+        })]
 
 
 def test_store_pruning_preserves_active_run(monkeypatch, tmp_path):

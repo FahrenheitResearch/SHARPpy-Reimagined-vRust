@@ -63,7 +63,8 @@ def test_native_adapter_does_not_call_covered_python_analysis_methods(monkeypatc
 
     for name in (
             "get_parcels", "get_thermo", "get_kinematics", "get_severe",
-            "get_traj", "get_indices", "get_watch"):
+            "get_traj", "get_indices", "get_watch", "get_fire",
+            "get_precip", "get_sars"):
         monkeypatch.setattr(sp_profile.ConvectiveProfile, name, forbidden)
 
     prof = NativeConvectiveProfile(**_kwargs())
@@ -77,6 +78,74 @@ def test_native_adapter_does_not_call_covered_python_analysis_methods(monkeypatc
         "SARS-analog-databases",
         "PWV-station-climatology",
     )
+
+
+def test_python_only_feature_subset_matches_full_vendored_methods():
+    """Removing overwritten work must not change retained Python outputs."""
+    from sharppy.sharptab import profile as sp_profile
+    from sharpmod.sharptab.native_profile import NativeConvectiveProfile
+
+    prof = NativeConvectiveProfile(**_kwargs())
+
+    fire_names = (
+        "ppbl_top", "sfc_rh", "pbl_h", "rh01km", "pblrh",
+        "meanwind01km", "meanwindpbl", "pblmaxwind",
+    )
+    optimized_fire = {name: getattr(prof, name) for name in fire_names}
+    sp_profile.ConvectiveProfile.get_fire(prof)
+    prof._apply_native_fire(prof._sharpmod_native_analysis)
+    for name, expected in optimized_fire.items():
+        np.testing.assert_equal(getattr(prof, name), expected)
+
+    precip_names = (
+        "dgz_meanomeg", "oprh", "plevel", "phase", "tmp", "st",
+        "tpos", "tneg", "ttop", "tbot", "wpos", "wneg", "wtop",
+        "wbot", "precip_type",
+    )
+    # Restore the optimized path before taking its precip snapshot; get_fire
+    # does not alter these values, but this keeps the comparison explicit.
+    prof._run_python_precip_details()
+    prof._apply_native_precip_type()
+    optimized_precip = {
+        name: getattr(prof, name) for name in precip_names}
+    sp_profile.ConvectiveProfile.get_precip(prof)
+    prof._apply_native_winter(prof._sharpmod_native_analysis)
+    prof._apply_native_precip_type()
+    for name, expected in optimized_precip.items():
+        np.testing.assert_equal(getattr(prof, name), expected)
+
+    match_names = (
+        "right_matches", "left_matches", "right_supercell_matches",
+        "left_supercell_matches", "matches", "supercell_matches",
+    )
+    prof._run_python_sars_matches()
+    optimized_matches = {name: getattr(prof, name) for name in match_names}
+    sp_profile.ConvectiveProfile.get_sars(prof)
+    for name, expected in optimized_matches.items():
+        np.testing.assert_equal(getattr(prof, name), expected)
+
+
+def test_sars_tables_are_parsed_once_across_profiles(monkeypatch):
+    from sharpmod.sharptab import sars_cache
+    from sharpmod.sharptab.native_profile import NativeConvectiveProfile
+
+    calls = []
+    original = sars_cache._ORIGINAL_LOADTXT
+
+    def counted(path, *args, **kwargs):
+        calls.append(str(path))
+        return original(path, *args, **kwargs)
+
+    sars_cache.clear_cache()
+    monkeypatch.setattr(sars_cache, "_ORIGINAL_LOADTXT", counted)
+    try:
+        NativeConvectiveProfile(**_kwargs())
+        NativeConvectiveProfile(**_kwargs())
+        assert len(calls) == 2
+        assert sum(path.endswith("sars_hail.txt") for path in calls) == 1
+        assert sum(path.endswith("sars_supercell.txt") for path in calls) == 1
+    finally:
+        sars_cache.clear_cache()
 
 
 def test_native_adapter_matches_python_oracle_on_supported_fields():

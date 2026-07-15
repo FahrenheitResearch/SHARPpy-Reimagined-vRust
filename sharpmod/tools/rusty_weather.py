@@ -7,11 +7,17 @@ the existing SHARPpy Reimagined ``.npz`` contract.
 
 from __future__ import annotations
 
+import atexit
 import json
+import logging
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,10 +32,258 @@ from sharpmod.tools.era5_extract import (
 
 SCHEMA = "sharpmod.point-sounding.v1"
 SUPPORTED_MODELS = frozenset(("hrrr", "gfs", "rrfs-a"))
+_POINT_SERVER_REQUEST_TIMEOUT = 30.0
+_LOGGER = logging.getLogger(__name__)
 
 
 class RustCacheMiss(RetrievalError):
     """The requested model hour is not present in the durable Rust store."""
+
+
+class _PointServerTransportError(RuntimeError):
+    """The optional persistent exporter protocol could not be used."""
+
+
+class _RustPointServer:
+    """Serialize requests through one long-lived ``rw_sharpmod`` process.
+
+    The helper retains its mmap-backed hour reader and decompressed grid, so a
+    follow-up map click performs only the sub-millisecond column read.  A lock
+    keeps the protocol safe if independent GUI workers briefly overlap.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._process = None
+        self._exporter = None
+        self._responses = None
+        self._reader = None
+        self._errors = None
+        self._stderr_reader = None
+        self._request_id = 0
+        self._disabled = set()
+
+    @staticmethod
+    def _key(exporter):
+        return os.path.normcase(os.path.abspath(os.fspath(exporter)))
+
+    @staticmethod
+    def _pump_stdout(stream, responses):
+        try:
+            for line in stream:
+                responses.put(line)
+        except (OSError, ValueError):
+            # The owner may close the pipe while stopping a timed-out helper.
+            pass
+        finally:
+            responses.put(None)
+
+    @staticmethod
+    def _pump_stderr(stream, errors):
+        """Drain stderr continuously while retaining only bounded context."""
+        try:
+            for line in stream:
+                errors.append(line.rstrip())
+        except (OSError, ValueError):
+            # Normal during concurrent helper shutdown.
+            pass
+
+    def _stop_locked(self):
+        process = self._process
+        self._process = None
+        self._exporter = None
+        self._responses = None
+        self._reader = None
+        self._errors = None
+        self._stderr_reader = None
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def stop(self):
+        with self._lock:
+            self._stop_locked()
+
+    def disable(self, exporter):
+        """Use the compatible one-shot CLI for this executable this session."""
+        with self._lock:
+            key = self._key(exporter)
+            self._disabled.add(key)
+            if self._exporter == key:
+                self._stop_locked()
+
+    def _start_locked(self, exporter):
+        key = self._key(exporter)
+        if key in self._disabled:
+            raise _PointServerTransportError(
+                "persistent export is disabled for this helper")
+        if self._process is not None and self._exporter == key \
+                and self._process.poll() is None:
+            return
+        self._stop_locked()
+        responses = queue.Queue()
+        errors = deque(maxlen=40)
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            process = subprocess.Popen(
+                [os.fspath(exporter), "--serve"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                **kwargs,
+            )
+        except OSError as exc:
+            raise _PointServerTransportError(
+                f"could not start persistent point exporter: {exc}") from exc
+        reader = threading.Thread(
+            target=self._pump_stdout,
+            args=(process.stdout, responses),
+            name="rw-sharpmod-stdout",
+            daemon=True,
+        )
+        reader.start()
+        stderr_reader = threading.Thread(
+            target=self._pump_stderr,
+            args=(process.stderr, errors),
+            name="rw-sharpmod-stderr",
+            daemon=True,
+        )
+        stderr_reader.start()
+        self._process = process
+        self._exporter = key
+        self._responses = responses
+        self._reader = reader
+        self._errors = errors
+        self._stderr_reader = stderr_reader
+
+    def _request(self, exporter, action, cache_root, model, run_time, fxx,
+                 *, lat=None, lon=None, output=None, cancelled=None):
+        with self._lock:
+            self._start_locked(exporter)
+            if cancelled is not None and cancelled():
+                self._stop_locked()
+                from sharpmod.model_transport import DownloadCancelled
+                raise DownloadCancelled(
+                    "Rusty Weather point-sounding export cancelled")
+            self._request_id += 1
+            request_id = self._request_id
+            request = {
+                "request_id": request_id,
+                "action": str(action),
+                "store_root": os.fspath(Path(cache_root) / "store"),
+                "model": str(model),
+                "run": _run_id(run_time),
+                "forecast_hour": int(fxx),
+            }
+            if lat is not None:
+                request["lat"] = float(lat)
+            if lon is not None:
+                request["lon"] = float(lon)
+            if output is not None:
+                request["output"] = os.fspath(output)
+            process = self._process
+            responses = self._responses
+            deadline = time.monotonic() + _POINT_SERVER_REQUEST_TIMEOUT
+            try:
+                process.stdin.write(json.dumps(request, separators=(",", ":")))
+                process.stdin.write("\n")
+                process.stdin.flush()
+            except (AttributeError, OSError, BrokenPipeError) as exc:
+                self._stop_locked()
+                raise _PointServerTransportError(
+                    f"persistent point exporter pipe failed: {exc}") from exc
+
+            while True:
+                if cancelled is not None and cancelled():
+                    self._stop_locked()
+                    from sharpmod.model_transport import DownloadCancelled
+                    raise DownloadCancelled(
+                        "Rusty Weather point-sounding export cancelled")
+                try:
+                    line = responses.get(timeout=0.05)
+                except queue.Empty:
+                    if time.monotonic() >= deadline:
+                        detail = "; ".join(self._errors or ())
+                        self._stop_locked()
+                        message = (
+                            "persistent point exporter timed out after "
+                            f"{_POINT_SERVER_REQUEST_TIMEOUT:.1f}s")
+                        if detail:
+                            message += f": {detail[-2000:]}"
+                        raise _PointServerTransportError(message)
+                    if process.poll() is not None:
+                        detail = "; ".join(self._errors or ())
+                        self._stop_locked()
+                        message = (
+                            "persistent point exporter exited without a response")
+                        if detail:
+                            message += f": {detail[-2000:]}"
+                        raise _PointServerTransportError(message)
+                    continue
+                if line is None:
+                    detail = "; ".join(self._errors or ())
+                    self._stop_locked()
+                    message = "persistent point exporter closed its output"
+                    if detail:
+                        message += f": {detail[-2000:]}"
+                    raise _PointServerTransportError(message)
+                try:
+                    response = json.loads(line)
+                except ValueError as exc:
+                    self._stop_locked()
+                    raise _PointServerTransportError(
+                        "persistent point exporter returned invalid JSON") from exc
+                if response.get("request_id") != request_id:
+                    self._stop_locked()
+                    raise _PointServerTransportError(
+                        "persistent point exporter response was out of sequence")
+                if not response.get("ok"):
+                    raise RetrievalError(
+                        "Rusty Weather point-sounding export failed: "
+                        + str(response.get("error") or "unknown error"))
+                return response
+
+    def export(self, exporter, cache_root, model, run_time, fxx, lat, lon,
+               output, cancelled=None):
+        return self._request(
+            exporter, "export", cache_root, model, run_time, fxx,
+            lat=lat, lon=lon, output=output, cancelled=cancelled)
+
+    def warm(self, exporter, cache_root, model, run_time, fxx,
+             cancelled=None):
+        return self._request(
+            exporter, "warm", cache_root, model, run_time, fxx,
+            cancelled=cancelled)
+
+
+_POINT_SERVER = _RustPointServer()
+atexit.register(_POINT_SERVER.stop)
 
 
 def backend_mode():
@@ -371,19 +625,39 @@ def _export_cached_point(exporter, cache_root, model, run_time, fxx, lat, lon,
     os.close(fd)
     try:
         _report(progress, "Extracting nearest-grid-point sounding", 78)
-        command = [
-            exporter,
-            "--store-root", cache_root / "store",
-            "--model", model,
-            "--run", _run_id(run_time),
-            "--forecast-hour", str(int(fxx)),
-            "--lat", repr(float(lat)),
-            "--lon", repr(float(lon)),
-            "--output", bridge_path,
-        ]
-        _run_command(
-            command, "Rusty Weather point-sounding export",
-            cancelled=cancelled)
+        started = time.perf_counter()
+        try:
+            _POINT_SERVER.export(
+                exporter, cache_root, model, run_time, fxx, lat, lon,
+                bridge_path, cancelled=cancelled)
+            mode = "persistent"
+        except _PointServerTransportError as exc:
+            # External/older rw_sharpmod binaries retain their documented
+            # one-shot CLI. Remember the incompatibility for this process so
+            # later clicks do not repeatedly attempt an unsupported protocol.
+            _POINT_SERVER.disable(exporter)
+            _LOGGER.warning(
+                "persistent Rust point exporter unavailable; using one-shot "
+                "fallback: %s", exc)
+            command = [
+                exporter,
+                "--store-root", cache_root / "store",
+                "--model", model,
+                "--run", _run_id(run_time),
+                "--forecast-hour", str(int(fxx)),
+                "--lat", repr(float(lat)),
+                "--lon", repr(float(lon)),
+                "--output", bridge_path,
+            ]
+            _run_command(
+                command, "Rusty Weather point-sounding export",
+                cancelled=cancelled)
+            mode = "one-shot"
+        _LOGGER.info(
+            "rusty_weather.cached_export mode=%s elapsed_ms=%.1f model=%s "
+            "run=%s fxx=%03d",
+            mode, (time.perf_counter() - started) * 1000.0, model,
+            _run_id(run_time), int(fxx))
         _report(progress, "Converting sounding for SHARPpy", 84)
         return json_to_npz(bridge_path, out_path, label=label, loc=loc)
     finally:
@@ -412,10 +686,14 @@ def extract_cached(model, lat, lon, run_time, fxx, out_path, label=None,
             f"native model hour is not cached: {model} {_run_id(run_time)} "
             f"F{int(fxx):03d}")
     _report(progress, "Using cached model hour", 60)
-    prune_store(cache_root, preserve=hour_path.parent.resolve())
-    return _export_cached_point(
+    result = _export_cached_point(
         exporter, cache_root, model, run_time, fxx, lat, lon, out_path,
         label=label, loc=loc, progress=progress, cancelled=cancelled)
+    # The server has switched away from any prior hour before pruning. This
+    # matters on Windows, where an mmap-backed old `.rws` cannot be removed
+    # while the helper still has it open.
+    prune_store(cache_root, preserve=hour_path.parent.resolve())
+    return result
 
 
 def cache_hour(model, run_time, fxx, cache_root=None, progress=None,
@@ -434,8 +712,10 @@ def cache_hour(model, run_time, fxx, cache_root=None, progress=None,
     binaries = find_binaries()
     if binaries is None:
         raise RetrievalError("Rusty Weather executables are not installed")
-    ingest, _exporter = binaries
+    ingest, exporter = binaries
     cache_root = Path(cache_root) if cache_root else default_cache_root()
+    # Release any mmap before an ingest may replace or prune its store file.
+    _POINT_SERVER.stop()
     try:
         hour_path = _ensure_hour(
             ingest, cache_root, model, run_time, fxx, progress=progress,
@@ -446,6 +726,25 @@ def cache_hour(model, run_time, fxx, cache_root=None, progress=None,
         # not-yet-published run fails.
         _discard_raw_downloads(cache_root)
     prune_store(cache_root, preserve=hour_path.parent.resolve())
+    try:
+        warm_started = time.perf_counter()
+        _POINT_SERVER.warm(
+            exporter, cache_root, model, run_time, fxx,
+            cancelled=cancelled)
+        _LOGGER.info(
+            "rusty_weather.cache_warm elapsed_ms=%.1f model=%s run=%s "
+            "fxx=%03d",
+            (time.perf_counter() - warm_started) * 1000.0, model,
+            _run_id(run_time), int(fxx))
+    except _PointServerTransportError as exc:
+        _POINT_SERVER.disable(exporter)
+        _LOGGER.warning(
+            "persistent Rust point exporter could not be warmed; cached "
+            "one-shot export remains available: %s", exc)
+    except RetrievalError as exc:
+        # Caching succeeded; failure of the optional latency optimization
+        # must never turn a valid durable hour into a failed cache operation.
+        _LOGGER.warning("cached hour could not be pre-opened: %s", exc)
     _report(progress, "Model hour ready for fast map browsing", 100)
     return hour_path
 

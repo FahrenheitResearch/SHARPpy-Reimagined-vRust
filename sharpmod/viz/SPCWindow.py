@@ -144,6 +144,25 @@ def _install_streamwiseness_hooks():
     original_swap = cls.swapInset
     original_update = cls.updateProfs
 
+    class _ActiveInsetRefreshMap(dict):
+        """Expose every inset by key but iterate only mounted/visible ones.
+
+        Vendored ``updateProfs`` eagerly redraws every available inset even
+        though all but the current left/right pair are hidden.  A later inset
+        swap already has a well-defined refresh seam (wrapped below), so a
+        mounted SHARPmod window can defer those hidden pixmap rebuilds until
+        the inset is actually selected.  Keeping the complete mapping means
+        hemisphere/deviant updates can still address their named insets.
+        """
+
+        def __init__(self, source, refresh_names):
+            super().__init__(source)
+            self._refresh_names = tuple(
+                name for name in source if name in refresh_names)
+
+        def keys(self):
+            return self._refresh_names
+
     def toggleVector(self, deviant):  # noqa: N802 - upstream Qt API
         # ``updateProfs`` always reapplies the latitude-default vector even
         # when it is already selected.  Every vendored ``setDeviant`` performs
@@ -169,6 +188,19 @@ def _install_streamwiseness_hooks():
         return result
 
     def swapInset(self):  # noqa: N802 - upstream Qt API
+        # Hidden insets are refreshed lazily by ``updateProfs`` below.  Bring
+        # the selected one current immediately before the vendored swap mounts
+        # it, preserving the exact interaction/result while avoiding work for
+        # insets the user never opens.
+        if getattr(self, "index_board", None) is not None:
+            try:
+                action = self.menu_ag.checkedAction()
+                selected = action.data() if action is not None else None
+                inset = self.insets.get(selected)
+                if inset is not None and self.default_prof is not None:
+                    inset.setProf(self.default_prof)
+            except Exception:
+                pass
         result = original_swap(self)
         if getattr(self, "inset_to_swap", None) == "RIGHT":
             _place_right_inset_after_streamwiseness(self)
@@ -184,6 +216,8 @@ def _install_streamwiseness_hooks():
         staged_prof = None
         staged_derived = None
         staged_sound = False
+        stream_refreshed = False
+        all_insets = getattr(self, "insets", None)
         try:
             prof_col = self.prof_collections[self.pc_idx]
             staged_prof = prof_col.getHighlightedProf()
@@ -199,12 +233,37 @@ def _install_streamwiseness_hooks():
             staged_prof = None
             staged_derived = None
             staged_sound = False
-        result = original_update(self)
+        # The mounted chart keeps only the current left/right insets plus the
+        # custom streamwiseness chart visible.  Upstream nevertheless renders
+        # every hidden alternate on every profile change.  Limit that eager
+        # loop to mounted widgets; ``swapInset`` refreshes an alternate just
+        # before it becomes visible.
+        refresh_subset = None
+        if isinstance(all_insets, dict) \
+                and getattr(self, "index_board", None) is not None \
+                and getattr(self, "streamwiseness", None) is not None:
+            refresh_names = {
+                getattr(self, "left_inset", None),
+                getattr(self, "right_inset", None),
+                "SHARPMOD STREAMWISENESS",
+            }
+            refresh_subset = _ActiveInsetRefreshMap(
+                all_insets, refresh_names)
+            stream_refreshed = refresh_subset.get(
+                "SHARPMOD STREAMWISENESS") \
+                is getattr(self, "streamwiseness", None)
+            self.insets = refresh_subset
+        try:
+            result = original_update(self)
+        finally:
+            if refresh_subset is not None:
+                self.insets = all_insets
         _refresh_mounted_products(
             self,
             prof=staged_prof,
             derived=staged_derived,
             redraw_sound=not staged_sound,
+            refresh_stream=not stream_refreshed,
         )
         return result
 
@@ -688,14 +747,16 @@ def _derived_profile(prof):
 
 
 def _refresh_mounted_products(
-        sw, *, prof=None, derived=None, redraw_sound=True):
+        sw, *, prof=None, derived=None, redraw_sound=True,
+        refresh_stream=True):
     """Refresh custom products from the current profile.
 
-    ``updateProfs`` supplies a precomputed ``prof``/``derived`` pair and sets
+    ``updateProfs`` supplies a precomputed ``prof``/``derived`` pair, sets
     ``redraw_sound=False`` because the derived profile was staged before the
-    vendored Skew-T draw.  The defaults preserve the original standalone
-    refresh contract for preference/session callers that invoke this helper
-    after a profile update.
+    vendored Skew-T draw, and sets ``refresh_stream=False`` when upstream's
+    inset loop already refreshed the mounted streamwiseness chart.  The
+    defaults preserve the original standalone refresh contract for
+    preference/session callers that invoke this helper after a profile update.
     """
     if prof is None:
         prof = getattr(sw, "default_prof", None)
@@ -712,7 +773,7 @@ def _refresh_mounted_products(
             pass
 
     stream = getattr(sw, "streamwiseness", None)
-    if stream is not None:
+    if stream is not None and refresh_stream:
         try:
             stream.setProf(prof)
         except Exception:
