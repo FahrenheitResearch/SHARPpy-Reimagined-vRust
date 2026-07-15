@@ -534,7 +534,7 @@ dependencies = [
 [[package]]
 name = "ecape-rs"
 version = "0.1.4"
-source = "git+https://github.com/FahrenheitResearch/ecape-rs?rev=82922534c02a888e773c50463b5a49d535606276#82922534c02a888e773c50463b5a49d535606276"
+source = "git+https://github.com/FahrenheitResearch/ecape-rs?rev=414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0#414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0"
 dependencies = [
  "metrust",
  "serde",

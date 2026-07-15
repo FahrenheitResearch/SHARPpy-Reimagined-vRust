@@ -333,6 +333,24 @@ def test_index_board_formats_display_units(qt_app):
     assert board._uv_dirspd((10.0, 0.0)) == "270/05"
 
 
+def test_index_board_reads_cached_native_sweat(qt_app, monkeypatch):
+    """Painting must not rerun SHARPpy's Python SWEAT calculation."""
+    from sharppy.sharptab import params as sp_params
+    from sharpmod.viz.index_board import IndexBoard
+
+    board = IndexBoard()
+    board.sp = SimpleNamespace(sweat=417.25)
+    monkeypatch.setattr(
+        sp_params,
+        "sweat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy SWEAT calculation was called")),
+    )
+
+    assert board._sweat() == pytest.approx(417.25)
+    assert board._sweat() == pytest.approx(417.25)
+
+
 def test_index_board_preserves_primary_widths_with_compact_composites(qt_app):
     """Convective/kinematic columns retain room while SHIP/composites tighten."""
     from qtpy.QtCore import QRect

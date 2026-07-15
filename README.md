@@ -94,6 +94,7 @@ Rust, then build the pinned extension:
 git clone https://github.com/FahrenheitResearch/sharppyrs native/sharppyrs
 git -C native/sharppyrs checkout 958bcd685b1e28b8fce0ab5c7b8daea3cdd993aa
 git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+git -C native/sharppyrs apply ../patches/sharppyrs-sharppy-parity.patch
 cargo build --manifest-path native/sharpmod-native/Cargo.toml --release --locked
 python packaging/install_native_extension.py
 python -c "from sharpmod import sharpmod_native; print(sharpmod_native.backend_info())"
@@ -184,27 +185,67 @@ records per-result provenance (`sharprs-core`, `sharppyrs-rust`, and
 `ecape-rs`). `backend_info()` also exposes the exact pinned `sharppyrs`,
 `sharprs`, and `ecape-rs` revisions used to build it.
 
-Python remains intentional for four inputs the pinned Rust interface does not
-currently own: detailed fire-PBL fields, precipitation-source/layer-energy
-analysis, SARS analog databases, and station PWV climatology. The Rust
-precipitation-type and watch classifiers consume those results when available.
-If the extension is missing, disabled, rejects the profile, or fails at
-runtime, the app constructs the full legacy-compatible Python
+The Rust ECAPE path is compared directly with `ecape-parcel-py` over committed
+synthetic, observed, HRRR point and BUFKIT profiles; the current 55 comparable
+cases all satisfy the release threshold of `max(10 J/kg, 5%)`. See the
+[Rust ECAPE validation report](docs/ECAPE_RUST_VALIDATION.md) for the numerical
+summary, edge cases and reproduction command.
+
+The SHARPpy-compatibility corpus passed 83,631 of 83,631 comparisons across 57
+profiles. The complete 100-case fixed-seed stress run then found one
+zero-depth effective-layer edge with three failed comparisons. After the
+targeted correction, that case passed 1,455 of 1,455 comparisons and the
+affected canonical profile passed 1,473 of 1,473. See
+[Rust calculation parity](docs/NATIVE_PARITY.md) for the scope and tolerances.
+
+All normal runtime meteorological calculations are native, including detailed
+fire/PBL diagnostics and precipitation source/layer-energy analysis. On a
+successful native profile, Python remains only for the SARS analog-database
+and station PWV-climatology lookups; these are data lookups, not calculation
+fallbacks. If the extension is missing, disabled, rejects the profile, or
+fails at runtime, the app constructs the full legacy-compatible Python
 `ConvectiveProfile` instead. Set `SHARPMOD_DISABLE_NATIVE_ANALYSIS=1` to test
 that fallback explicitly.
 
-Representative development timings for the bundled 39-level HRRR sample are
-below. They were measured with a release-mode extension on one Windows
-development machine after import warm-up, so they are reference ranges rather
-than hardware or network guarantees.
+The final precipitation-only sweep passed 714 of 714 field comparisons across
+51 constructible committed real soundings; source, phase, layer-energy, and
+precipitation-type results matched the legacy oracle.
+
+### Compare Rust and Python in the viewer
+
+With a Rust-backed sounding highlighted, choose **Profiles → Compare Rust vs
+Python…**. The app snapshots that sounding and calculates a legacy Python
+`ConvectiveProfile` in a background thread only after you request the
+comparison. Normal sounding loads and cached map-point refreshes remain on the
+fast Rust path and do not pay for a second profile.
+
+The result window lists the Rust value, legacy Python value, absolute
+difference, allowed difference, and pass/fail result for each displayed field;
+differences are sorted first. Numeric rows use the same unit-specific
+tolerances as the release parity audit. Upstream legacy MMP reads undefined
+working-array cells, so MMP itself is informational. Watch rows marked
+`MMP-normalized` re-run the legacy watch classifier with the deterministic Rust
+MMP value instead of reporting allocator-dependent differences.
+
+Use **Show Legacy Python** to mount the reference as a temporary, separate
+profile or **Show Rust (fast)** to return to the original cached profile. The
+comparison never replaces the source sounding, and a cached result is not
+reused after that sounding changes. This interactive view is a convenient
+spot-check; the reproducible 57-profile corpus and 100-case stress audit remain
+the release gate. See [Rust calculation parity](docs/NATIVE_PARITY.md) for its
+scope, tolerances, seams, and reproduction commands.
+
+Final v0.3.2 calculation timings below use the release-mode extension on one
+Windows development machine after import warm-up. They are median calculation
+times, not hardware, GUI-paint, or network guarantees.
 
 | Operation | Observed time |
 | --- | ---: |
-| Bulk Rust analysis call | 1.4–1.9 ms |
-| Interactive Rust user-parcel lift | 0.72–0.85 ms |
-| Compatible profile, including the four Python-only feature groups | 39–48 ms |
-| `.npz` load + native profile + display companion | 40–52 ms |
-| Full legacy Python `ConvectiveProfile` on the same sample | 227–231 ms |
+| Bulk Rust analysis call | 2.00 ms |
+| Interactive Rust user-parcel lift | 0.60 ms |
+| Compatible profile, including the two Python lookup-only features | 6.98 ms |
+| `.npz` load + native profile + display companion | 8.93 ms |
+| Full legacy Python `ConvectiveProfile` on the same sample | 205.67 ms |
 
 Model transport is a separate cost. On the same development setup, an existing
 `.rws` hour exported another point in 39–49 ms; an uncached HRRR Zarr point took
@@ -456,6 +497,7 @@ forecast model                                  |
 ```text
 sharpmod/
   gui.py        interactive desktop app (sounding picker + SPC window)
+  gui_compare.py on-demand Rust/legacy-Python comparison window
   render.py     headless PNG render entry point
   sharptab/     derived-parameter and meteorological calculations
   io/           decoders for SPC, BUFKIT, PECAN, WRF-ARW, .npz, and UWyo
@@ -472,7 +514,9 @@ examples/
   soundings/    bundled sample inputs
 
 docs/
-  USAGE.md      workflow guide and API examples
+  USAGE.md                  workflow guide and API examples
+  NATIVE_PARITY.md          native calculation acceptance and reproduction
+  ECAPE_RUST_VALIDATION.md  analytic ECAPE oracle results
 ```
 
 ## Attribution

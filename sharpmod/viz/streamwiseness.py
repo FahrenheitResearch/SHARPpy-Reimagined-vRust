@@ -2,8 +2,9 @@
 
 The calculation is intentionally profile/decoder agnostic.  It consumes the
 standard SHARPpy height and wind-component arrays plus the shared Bunkers storm
-motion, interpolates them onto a 100 m AGL grid, and resolves the fraction of
-horizontal vorticity aligned with the storm-relative wind through 6 km.
+motion, interpolates them onto a 100 m AGL grid, and resolves the squared
+fraction of horizontal vorticity aligned with storm-relative wind through 6 km.
+The projection sign is carried separately only for directional shading.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 
 from sharpmod import colors
 from sharpmod.sharptab.constants import is_missing
-from sharpmod.sharptab import winds as sm_winds
+from sharpmod.sharptab import native_analysis, winds as sm_winds
 
 __all__ = [
     "StreamwisenessData",
@@ -36,6 +37,7 @@ class StreamwisenessData:
     height_km: np.ndarray
     percent: np.ndarray
     signed_percent: np.ndarray
+    backend: str = "rust"
 
 
 def _finite_vector(value, minimum_size=1):
@@ -83,19 +85,19 @@ def _storm_motion(prof, use_left):
             return None
         if not np.isfinite(value):
             return None
-        values.append(value * KTS_TO_MS)
+        values.append(value)
     return tuple(values)
 
 
-def streamwiseness_profile(
+def _python_streamwiseness_profile(
         prof, *, use_left=False, max_height_m=6000.0, step_m=100.0):
-    """Return the 0-6 km streamwiseness profile, or ``None`` when unavailable.
+    """Unavailable-native fallback for the streamwiseness profile.
 
     Horizontal vorticity is the horizontal part of ``curl(V)`` for a wind that
-    varies with height: ``(-dv/dz, du/dz)``.  Streamwiseness is the magnitude
-    of its projection onto the storm-relative wind unit vector divided by the
-    total horizontal-vorticity magnitude.  The sign is retained separately for
-    cyclonic/anticyclonic shading.
+    varies with height: ``(-dv/dz, du/dz)``. Streamwiseness is the squared
+    ratio of its streamwise projection to total horizontal-vorticity
+    magnitude. The projection sign is retained separately for directional
+    shading.
     """
     if prof is None or step_m <= 0 or max_height_m <= 0:
         return None
@@ -137,7 +139,8 @@ def streamwiseness_profile(
     motion = _storm_motion(prof, bool(use_left))
     if motion is None:
         return None
-    storm_u, storm_v = motion
+    storm_u, storm_v = (
+        motion[0] * KTS_TO_MS, motion[1] * KTS_TO_MS)
 
     u_ms = np.interp(grid, height, u) * KTS_TO_MS
     v_ms = np.interp(grid, height, v) * KTS_TO_MS
@@ -161,17 +164,62 @@ def streamwiseness_profile(
         omega_u[usable] * (u_sr[usable] / sr_speed[usable])
         + omega_v[usable] * (v_sr[usable] / sr_speed[usable])
     )
-    percent[usable] = np.clip(
-        np.abs(omega_streamwise[usable]) / omega_mag[usable] * 100.0,
-        0.0,
-        100.0,
-    )
+    ratio = omega_streamwise[usable] / omega_mag[usable]
+    percent[usable] = np.clip(ratio ** 2 * 100.0, 0.0, 100.0)
     signed[usable] = np.sign(omega_streamwise[usable]) * percent[usable]
 
     return StreamwisenessData(
         height_km=grid / 1000.0,
         percent=percent,
         signed_percent=signed,
+        backend="python-fallback",
+    )
+
+
+def streamwiseness_profile(
+        prof, *, use_left=False, max_height_m=6000.0, step_m=100.0):
+    """Return the native 0-6 km streamwiseness profile when usable."""
+    if prof is None or step_m <= 0 or max_height_m <= 0:
+        return None
+    height = _finite_vector(getattr(prof, "hght", None), minimum_size=2)
+    u, v = _wind_components(prof)
+    if height is None or u is None or v is None:
+        return None
+    if not (height.size == u.size == v.size):
+        return None
+    try:
+        sfc = int(getattr(prof, "sfc", 0) or 0)
+    except (TypeError, ValueError):
+        sfc = 0
+    if sfc < 0 or sfc >= height.size or not np.isfinite(height[sfc]):
+        return None
+    motion = _storm_motion(prof, bool(use_left))
+    if motion is None:
+        return None
+
+    try:
+        result = native_analysis.streamwiseness(
+            height, u, v,
+            sfc=sfc,
+            storm_motion=motion,
+            max_height_m=max_height_m,
+            step_m=step_m,
+        )
+    except native_analysis.NativeAnalysisUnavailable:
+        return _python_streamwiseness_profile(
+            prof,
+            use_left=use_left,
+            max_height_m=max_height_m,
+            step_m=step_m,
+        )
+    if result is None:
+        return None
+    height_m, percent, signed = result
+    return StreamwisenessData(
+        height_km=height_m / 1000.0,
+        percent=percent,
+        signed_percent=signed,
+        backend="rust",
     )
 
 
@@ -336,7 +384,7 @@ class plotStreamwiseness(QtWidgets.QFrame):
             painter,
             QtCore.QRectF(plot.left(), plot.bottom() + 13,
                           plot.width(), max(10, self.height() - plot.bottom() - 13)),
-            "Streamwiseness (%)",
+            "Squared ratio (%)",
             self.text_color,
         )
         painter.save()

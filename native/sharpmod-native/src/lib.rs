@@ -5,13 +5,15 @@
 //! analysis view-model (and therefore the real `sharprs` core) once per
 //! sounding, outside the GIL, and returns plain Python containers.
 
+mod precip_compat;
+
 use ecape_rs::{CapeType, ParcelOptions, StormMotionType, calc_ecape_ncape};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use sharppyrs::sharprs::fire;
 use sharppyrs::sharprs::params::cape::{
-    self, LiftedParcelLevel, ParcelResult, ParcelType as SharprsParcelType, parcelx,
+    self, LiftedParcelLevel, ParcelResult, ParcelType as SharprsParcelType,
 };
 use sharppyrs::sharprs::params::{composites, indices};
 use sharppyrs::sharprs::watch_type::{self, PrecipPhase, WatchParams};
@@ -27,6 +29,153 @@ struct EcapeResult {
     cape: f64,
     lfc_m_msl: Option<f64>,
     el_m_msl: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct StreamwisenessResult {
+    height_m: Vec<f64>,
+    percent: Vec<f64>,
+    signed_percent: Vec<f64>,
+}
+
+fn linear_interpolate(x: f64, xs: &[f64], values: &[f64], cursor: &mut usize) -> f64 {
+    if x <= xs[0] {
+        return values[0];
+    }
+    let last = xs.len() - 1;
+    if x >= xs[last] {
+        return values[last];
+    }
+    while *cursor + 1 < xs.len() && xs[*cursor + 1] < x {
+        *cursor += 1;
+    }
+    let x0 = xs[*cursor];
+    let x1 = xs[*cursor + 1];
+    let fraction = (x - x0) / (x1 - x0);
+    values[*cursor] + (values[*cursor + 1] - values[*cursor]) * fraction
+}
+
+/// Rust implementation of the streamwiseness inset's complete numeric path.
+///
+/// Wind and storm-motion inputs use knots; all derivatives and thresholds are
+/// evaluated in SI units. Equal heights retain the first sample after a
+/// stable sort, matching NumPy's ``unique(..., return_index=True)`` behavior.
+fn streamwiseness_core(
+    height_msl_m: &[f64],
+    u_kts: &[f64],
+    v_kts: &[f64],
+    sfc: usize,
+    storm_u_kts: f64,
+    storm_v_kts: f64,
+    max_height_m: f64,
+    step_m: f64,
+) -> Option<StreamwisenessResult> {
+    if height_msl_m.len() != u_kts.len()
+        || height_msl_m.len() != v_kts.len()
+        || height_msl_m.len() < 2
+        || sfc >= height_msl_m.len()
+        || !height_msl_m[sfc].is_finite()
+        || !storm_u_kts.is_finite()
+        || !storm_v_kts.is_finite()
+        || !max_height_m.is_finite()
+        || !step_m.is_finite()
+        || max_height_m <= 0.0
+        || step_m <= 0.0
+    {
+        return None;
+    }
+
+    let surface_height = height_msl_m[sfc];
+    let mut samples: Vec<(f64, f64, f64)> = height_msl_m[sfc..]
+        .iter()
+        .zip(&u_kts[sfc..])
+        .zip(&v_kts[sfc..])
+        .filter_map(|((&height, &u), &v)| {
+            let height_agl = height - surface_height;
+            (height_agl.is_finite() && u.is_finite() && v.is_finite()).then_some((height_agl, u, v))
+        })
+        .collect();
+    if samples.len() < 2 {
+        return None;
+    }
+    samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+    samples.dedup_by(|left, right| left.0 == right.0);
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let height: Vec<f64> = samples.iter().map(|sample| sample.0).collect();
+    let u: Vec<f64> = samples.iter().map(|sample| sample.1).collect();
+    let v: Vec<f64> = samples.iter().map(|sample| sample.2).collect();
+    let top = max_height_m.min(*height.last()?);
+    if top < step_m {
+        return None;
+    }
+    let step_count = (top / step_m).floor() as usize;
+    if step_count < 1 {
+        return None;
+    }
+    let grid: Vec<f64> = (0..=step_count)
+        .map(|index| index as f64 * step_m)
+        .collect();
+
+    let mut u_cursor = 0usize;
+    let mut v_cursor = 0usize;
+    let u_ms: Vec<f64> = grid
+        .iter()
+        .map(|&target| linear_interpolate(target, &height, &u, &mut u_cursor) * KTS_TO_MS)
+        .collect();
+    let v_ms: Vec<f64> = grid
+        .iter()
+        .map(|&target| linear_interpolate(target, &height, &v, &mut v_cursor) * KTS_TO_MS)
+        .collect();
+    let storm_u_ms = storm_u_kts * KTS_TO_MS;
+    let storm_v_ms = storm_v_kts * KTS_TO_MS;
+
+    let mut dudz = vec![f64::NAN; grid.len()];
+    let mut dvdz = vec![f64::NAN; grid.len()];
+    let last = grid.len() - 1;
+    dudz[0] = (u_ms[1] - u_ms[0]) / step_m;
+    dvdz[0] = (v_ms[1] - v_ms[0]) / step_m;
+    dudz[last] = (u_ms[last] - u_ms[last - 1]) / step_m;
+    dvdz[last] = (v_ms[last] - v_ms[last - 1]) / step_m;
+    for index in 1..last {
+        dudz[index] = (u_ms[index + 1] - u_ms[index - 1]) / (2.0 * step_m);
+        dvdz[index] = (v_ms[index + 1] - v_ms[index - 1]) / (2.0 * step_m);
+    }
+
+    let mut any_usable = false;
+    let mut percent = vec![f64::NAN; grid.len()];
+    let mut signed_percent = vec![f64::NAN; grid.len()];
+    for index in 0..grid.len() {
+        let omega_u = -dvdz[index];
+        let omega_v = dudz[index];
+        let omega_mag = omega_u.hypot(omega_v);
+        let u_sr = u_ms[index] - storm_u_ms;
+        let v_sr = v_ms[index] - storm_v_ms;
+        let sr_speed = u_sr.hypot(v_sr);
+        if omega_mag <= 1.0e-6 || sr_speed <= 0.1 {
+            continue;
+        }
+        let omega_streamwise = omega_u * (u_sr / sr_speed) + omega_v * (v_sr / sr_speed);
+        let ratio = omega_streamwise / omega_mag;
+        let value = (ratio * ratio * 100.0).clamp(0.0, 100.0);
+        let sign = if omega_streamwise > 0.0 {
+            1.0
+        } else if omega_streamwise < 0.0 {
+            -1.0
+        } else {
+            0.0
+        };
+        percent[index] = value;
+        signed_percent[index] = sign * value;
+        any_usable = true;
+    }
+    any_usable.then_some(StreamwisenessResult {
+        height_m: grid,
+        percent,
+        signed_percent,
+    })
 }
 
 fn specific_humidity(pressure_pa: f64, dewpoint_c: f64) -> f64 {
@@ -87,7 +236,6 @@ fn analytic_mu_ecape(profile: &Profile) -> Option<EcapeResult> {
     if !values.iter().all(|value| value.is_finite())
         || result.ecape_jkg < 0.0
         || result.cape_jkg < 0.0
-        || result.ecape_jkg > result.cape_jkg + 1.0e-6
     {
         return None;
     }
@@ -109,10 +257,14 @@ fn parcel_dict<'py>(py: Python<'py>, parcel: &ParcelResult) -> PyResult<Bound<'p
     }
     fields!(
         pres, tmpc, dwpc, bplus, bminus, lclpres, lclhght, lfcpres, lfchght, elpres, elhght,
-        mplpres, mplhght, bfzl, b3km, b6km, li5, li3, limax, limaxpres, cap, cappres, bmin,
-        bminpres, p0c, pm10c, pm20c, pm30c, hght0c, hghtm10c, hghtm20c, hghtm30c, wm10c, wm20c,
-        wm30c, ptrace, ttrace,
+        mplpres, bfzl, b3km, b6km, li5, li3, limax, limaxpres, cap, cappres, bmin, bminpres, p0c,
+        pm10c, pm20c, pm30c, hght0c, hghtm10c, hghtm20c, hghtm30c, wm10c, wm20c, wm30c, ptrace,
+        ttrace,
     );
+    // SHARPpy can retain a previously diagnosed MPL height after a later EL
+    // crossing masks only MPL pressure.  It is an observable legacy quirk,
+    // so expose the two fields independently rather than sanitizing it here.
+    result.set_item("mplhght", parcel.mplhght)?;
     Ok(result)
 }
 
@@ -223,11 +375,10 @@ fn helicity_or_nan(
     stu: f64,
     stv: f64,
 ) -> (f64, f64, f64) {
-    winds::helicity(profile, lower, upper, stu, stv, -1.0, true).unwrap_or((
-        f64::NAN,
-        f64::NAN,
-        f64::NAN,
-    ))
+    if (!stu.is_finite() || !stv.is_finite()) && sharppyrs::extras::has_constant_wind(profile) {
+        return (0.0, 0.0, 0.0);
+    }
+    sharppyrs::extras::helicity(profile, lower, upper, stu, stv)
 }
 
 fn sr_wind_or_nan(
@@ -237,7 +388,186 @@ fn sr_wind_or_nan(
     stu: f64,
     stv: f64,
 ) -> (f64, f64) {
+    // SHARPpy's exclusive np.arange stop leaves a zero-depth effective layer
+    // with exactly its one reported pressure sample.  sharprs's inclusive
+    // loop otherwise adds ptop - 1 hPa and biases both mover diagnostics.
+    if (pbot - ptop).abs() <= 1.0e-9 {
+        let (u, v) = profile.interp_wind(pbot);
+        if u.is_finite() && v.is_finite() && stu.is_finite() && stv.is_finite() {
+            return (u - stu, v - stv);
+        }
+        return (f64::NAN, f64::NAN);
+    }
     comp_or_nan(winds::sr_wind(profile, pbot, ptop, stu, stv, -1.0))
+}
+
+/// SHARPpy's pressure interpolator removes masked samples before applying
+/// `numpy.interp` in log-pressure space.  Keep this local compatibility path
+/// for fields whose public values are compared directly with legacy SHARPpy.
+fn interp_pressure_sharppy(
+    profile: &sharppyrs::sharprs::Profile,
+    field: &[f64],
+    target: f64,
+) -> f64 {
+    if !target.is_finite() || target <= 0.0 {
+        return f64::NAN;
+    }
+    let valid: Vec<(f64, f64)> = profile
+        .pres
+        .iter()
+        .copied()
+        .zip(field.iter().copied())
+        .filter(|(pressure, value)| pressure.is_finite() && *pressure > 0.0 && value.is_finite())
+        .collect();
+    if valid.is_empty() || target > valid[0].0 || target < valid[valid.len() - 1].0 {
+        return f64::NAN;
+    }
+    for &(pressure, value) in &valid {
+        if target == pressure {
+            return value;
+        }
+    }
+    for pair in valid.windows(2) {
+        let (p0, v0) = pair[0];
+        let (p1, v1) = pair[1];
+        if target <= p0 && target >= p1 {
+            let fraction = (target.ln() - p1.ln()) / (p0.ln() - p1.ln());
+            return v1 + (v0 - v1) * fraction;
+        }
+    }
+    f64::NAN
+}
+
+/// Exact `np.arange(pbot, ptop - 1, -1)` grid used by SHARPpy's fast
+/// pressure-layer means.  Fractional bounds intentionally keep their
+/// fractional offset instead of snapping the final point to `ptop`.
+fn sharppy_pressure_grid(pbot: f64, ptop: f64) -> Vec<f64> {
+    if !pbot.is_finite() || !ptop.is_finite() || pbot < ptop {
+        return Vec::new();
+    }
+    let count = (pbot - ptop + 1.0).ceil().max(0.0) as usize;
+    (0..count).map(|index| pbot - index as f64).collect()
+}
+
+fn sharppy_pressure_weighted_mean(
+    profile: &sharppyrs::sharprs::Profile,
+    field: &[f64],
+    pbot: f64,
+    ptop: f64,
+) -> f64 {
+    let mut weighted = 0.0;
+    let mut weights = 0.0;
+    for pressure in sharppy_pressure_grid(pbot, ptop) {
+        let value = interp_pressure_sharppy(profile, field, pressure);
+        if value.is_finite() {
+            weighted += value * pressure;
+            weights += pressure;
+        }
+    }
+    if weights > 0.0 {
+        weighted / weights
+    } else {
+        f64::NAN
+    }
+}
+
+fn sharppy_mean_relh(profile: &sharppyrs::sharprs::Profile, mut pbot: f64, ptop: f64) -> f64 {
+    if !interp_pressure_sharppy(profile, &profile.tmpc, pbot).is_finite() {
+        pbot = profile.sfc_pressure();
+    }
+    if !interp_pressure_sharppy(profile, &profile.tmpc, ptop).is_finite() {
+        return f64::NAN;
+    }
+    let mut weighted = 0.0;
+    let mut weights = 0.0;
+    for pressure in sharppy_pressure_grid(pbot, ptop) {
+        let temp = interp_pressure_sharppy(profile, &profile.tmpc, pressure);
+        let dewpoint = interp_pressure_sharppy(profile, &profile.dwpc, pressure);
+        if temp.is_finite() && dewpoint.is_finite() {
+            let rh = thermo::relh(pressure, temp, dewpoint);
+            if rh.is_finite() {
+                weighted += rh * pressure;
+                weights += pressure;
+            }
+        }
+    }
+    if weights > 0.0 {
+        weighted / weights
+    } else {
+        f64::NAN
+    }
+}
+
+fn sharppy_pbl_top(profile: &sharppyrs::sharprs::Profile) -> f64 {
+    let theta_v = |index: usize| {
+        let pressure = profile.pres[index];
+        let temp = profile.tmpc[index];
+        let dewpoint = profile.dwpc[index];
+        if pressure.is_finite() && temp.is_finite() && dewpoint.is_finite() {
+            thermo::theta(
+                pressure,
+                thermo::virtemp(pressure, temp, Some(dewpoint)),
+                1000.0,
+            )
+        } else {
+            f64::NAN
+        }
+    };
+    let surface_theta_v = theta_v(profile.sfc);
+    if surface_theta_v.is_finite() {
+        for index in 0..profile.pres.len() {
+            let value = theta_v(index);
+            if value.is_finite() && value > surface_theta_v + 0.5 {
+                return profile.pres[index];
+            }
+        }
+    }
+    profile.pres.last().copied().unwrap_or(f64::NAN)
+}
+
+fn sharppy_observed_max_wind(
+    profile: &sharppyrs::sharprs::Profile,
+    observed_wind_valid: Option<&[bool]>,
+    lower: f64,
+    upper: f64,
+) -> (f64, f64, f64) {
+    let Some(observed) = observed_wind_valid else {
+        return winds::max_wind(profile, lower, upper).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+    };
+    if observed.len() != profile.pres.len() || !lower.is_finite() || !upper.is_finite() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let plower = profile.pres_at_height(profile.to_msl(lower));
+    let pupper = profile.pres_at_height(profile.to_msl(upper));
+    if !plower.is_finite() || !pupper.is_finite() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let is_close = |left: f64, right: f64| (left - right).abs() <= 1.0e-8 + 1.0e-5 * right.abs();
+    let mut best: Option<(f64, f64, f64, f64)> = None;
+    for (index, was_observed) in observed.iter().copied().enumerate() {
+        if !was_observed {
+            continue;
+        }
+        let pressure = profile.pres[index];
+        let u = profile.u[index];
+        let v = profile.v[index];
+        if !pressure.is_finite() || !u.is_finite() || !v.is_finite() {
+            continue;
+        }
+        let below_lower = pressure < plower || is_close(pressure, plower);
+        let above_upper = pressure > pupper || is_close(pressure, pupper);
+        if !below_lower || !above_upper {
+            continue;
+        }
+        let speed = u.hypot(v);
+        // Strictly greater preserves the first (lowest-altitude) observation
+        // when equal maxima occur, matching SHARPpy's documented contract.
+        if best.is_none_or(|current| speed > current.0) {
+            best = Some((speed, u, v, pressure));
+        }
+    }
+    best.map(|(_, u, v, pressure)| (u, v, pressure))
+        .unwrap_or((f64::NAN, f64::NAN, f64::NAN))
 }
 
 fn effective_parcel(profile: &Profile) -> ParcelResult {
@@ -245,38 +575,35 @@ fn effective_parcel(profile: &Profile) -> ParcelResult {
         return profile.sfcpcl.clone();
     }
     let inner = &profile.inner;
-    let Some(mean_theta) = indices::mean_theta(inner, Some(profile.ebottom), Some(profile.etop))
+    let Some(mean_theta) =
+        sharppyrs::extras::sharppy_mean_theta(inner, profile.ebottom, profile.etop)
     else {
         return profile.sfcpcl.clone();
     };
     let Some(mean_mixratio) =
-        indices::mean_mixratio(inner, Some(profile.ebottom), Some(profile.etop))
+        sharppyrs::extras::sharppy_mean_mixratio(inner, profile.ebottom, profile.etop)
     else {
         return profile.sfcpcl.clone();
     };
     let pres = (profile.ebottom + profile.etop) / 2.0;
     let tmpc = thermo::theta(1000.0, mean_theta, pres);
     let dwpc = thermo::temp_at_mixrat(mean_mixratio, pres);
-    let cape_profile = cape::Profile::new(
-        inner.pres.clone(),
-        inner.hght.clone(),
-        inner.tmpc.clone(),
-        inner.dwpc.clone(),
-        inner.sfc,
-    );
+    let cape_profile = sharppyrs::extras::cape_profile(inner);
     let level = LiftedParcelLevel {
         pres,
         tmpc,
         dwpc,
         parcel_type: SharprsParcelType::UserDefined { pres, tmpc, dwpc },
     };
-    parcelx(&cape_profile, &level, None, None)
+    sharppyrs::extras::parcelx_sharppy(&cape_profile, &level, None, None)
 }
 
 fn extra_dict<'py>(
     py: Python<'py>,
     profile: &Profile,
     derived: &DerivedParams,
+    observed_wind_valid: Option<&[bool]>,
+    missing: f64,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
     let inner = &profile.inner;
@@ -319,13 +646,22 @@ fn extra_dict<'py>(
     result.set_item("left_srh3km", left_srh3km)?;
     result.set_item("right_esrh", right_esrh)?;
     result.set_item("left_esrh", left_esrh)?;
+    let has_effective_layer = profile.ebottom.is_finite() && profile.etop.is_finite();
     result.set_item(
         "right_critical_angle",
-        winds::critical_angle(inner, rstu, rstv).unwrap_or(f64::NAN),
+        if has_effective_layer {
+            winds::critical_angle(inner, rstu, rstv).unwrap_or(f64::NAN)
+        } else {
+            f64::NAN
+        },
     )?;
     result.set_item(
         "left_critical_angle",
-        winds::critical_angle(inner, lstu, lstv).unwrap_or(f64::NAN),
+        if has_effective_layer {
+            winds::critical_angle(inner, lstu, lstv).unwrap_or(f64::NAN)
+        } else {
+            f64::NAN
+        },
     )?;
     result.set_item(
         "sfc_9km_shear",
@@ -390,22 +726,39 @@ fn extra_dict<'py>(
         shear6_ms,
     )
     .unwrap_or(f64::NAN);
-    let right_stp_cin = composites::stp_cin(
-        profile.mlpcl.bplus,
-        right_esrh.0,
-        ebwd_ms,
-        profile.mlpcl.lclhght,
-        profile.mlpcl.bminus,
-    )
-    .unwrap_or(f64::NAN);
-    let left_stp_cin = composites::stp_cin(
-        profile.mlpcl.bplus,
-        left_esrh.0,
-        ebwd_ms,
-        profile.mlpcl.lclhght,
-        profile.mlpcl.bminus,
-    )
-    .unwrap_or(f64::NAN);
+    let southern = inner.station.latitude < 0.0;
+    let mut right_stp_cin = if has_effective_layer {
+        composites::stp_cin(
+            profile.mlpcl.bplus,
+            if southern {
+                -right_esrh.0
+            } else {
+                right_esrh.0
+            },
+            ebwd_ms,
+            profile.mlpcl.lclhght,
+            profile.mlpcl.bminus,
+        )
+        .unwrap_or(f64::NAN)
+    } else {
+        0.0
+    };
+    let mut left_stp_cin = if has_effective_layer {
+        composites::stp_cin(
+            profile.mlpcl.bplus,
+            if southern { -left_esrh.0 } else { left_esrh.0 },
+            ebwd_ms,
+            profile.mlpcl.lclhght,
+            profile.mlpcl.bminus,
+        )
+        .unwrap_or(f64::NAN)
+    } else {
+        0.0
+    };
+    if southern {
+        right_stp_cin = -right_stp_cin;
+        left_stp_cin = -left_stp_cin;
+    }
     result.set_item("ebwspd", ebwspd)?;
     result.set_item("right_stp_fixed", right_stp_fixed)?;
     result.set_item("left_stp_fixed", left_stp_fixed)?;
@@ -414,7 +767,7 @@ fn extra_dict<'py>(
     result.set_item(
         "sherbe",
         composites::sherb(
-            (derived.eff_shear.0.powi(2) + derived.eff_shear.1.powi(2)).sqrt() * KTS_TO_MS,
+            ebwspd * KTS_TO_MS,
             derived.lapserate_3km,
             derived.lapserate_700_500,
             true,
@@ -445,20 +798,39 @@ fn extra_dict<'py>(
     fire_values.set_item("haines_low", fire::haines_low(t950, t850, td850))?;
     fire_values.set_item("haines_mid", fire::haines_mid(t850, t700, td850))?;
     fire_values.set_item("haines_high", fire::haines_high(t700, t500, td700))?;
-    let cape_profile = cape::Profile::new(
-        inner.pres.clone(),
-        inner.hght.clone(),
-        inner.tmpc.clone(),
-        inner.dwpc.clone(),
-        inner.sfc,
-    );
+    let cape_profile = sharppyrs::extras::cape_profile(inner);
     let fire_level = cape::define_parcel(
         &cape_profile,
         SharprsParcelType::MostUnstable { depth_hpa: 500.0 },
     );
     fire_values.set_item(
         "bplus_fire",
-        cape::cape(&cape_profile, &fire_level, None, None).bplus,
+        cape::parcelx(&cape_profile, &fire_level, None, None).bplus,
+    )?;
+    let ppbl_top = sharppy_pbl_top(inner);
+    let pbl_h = inner.to_agl(interp_pressure_sharppy(inner, &inner.hght, ppbl_top));
+    let p1km = inner.pres_at_height(inner.to_msl(1_000.0));
+    let meanwind01km = (
+        sharppy_pressure_weighted_mean(inner, &inner.u, surface, p1km),
+        sharppy_pressure_weighted_mean(inner, &inner.v, surface, p1km),
+    );
+    let meanwindpbl = (
+        sharppy_pressure_weighted_mean(inner, &inner.u, surface, ppbl_top),
+        sharppy_pressure_weighted_mean(inner, &inner.v, surface, ppbl_top),
+    );
+    fire_values.set_item("ppbl_top", ppbl_top)?;
+    fire_values.set_item("pbl_h", pbl_h)?;
+    fire_values.set_item(
+        "sfc_rh",
+        thermo::relh(inner.pres[sfc], inner.tmpc[sfc], inner.dwpc[sfc]),
+    )?;
+    fire_values.set_item("rh01km", sharppy_mean_relh(inner, surface, p1km))?;
+    fire_values.set_item("pblrh", sharppy_mean_relh(inner, surface, ppbl_top))?;
+    fire_values.set_item("meanwind01km", meanwind01km)?;
+    fire_values.set_item("meanwindpbl", meanwindpbl)?;
+    fire_values.set_item(
+        "pblmaxwind",
+        sharppy_observed_max_wind(inner, observed_wind_valid, 0.0, pbl_h),
     )?;
     result.set_item("fire", fire_values)?;
 
@@ -478,6 +850,22 @@ fn extra_dict<'py>(
         "dgz_meanq",
         indices::mean_mixratio(inner, Some(dgz_pbot), Some(dgz_ptop)),
     )?;
+    let precip = precip_compat::compute(inner, missing);
+    winter.set_item("dgz_meanomeg", precip.dgz_meanomeg)?;
+    winter.set_item("oprh", precip.oprh)?;
+    winter.set_item("plevel", precip.plevel)?;
+    winter.set_item("phase", precip.phase)?;
+    winter.set_item("tmp", precip.tmp)?;
+    winter.set_item("st", precip.st)?;
+    winter.set_item("tpos", precip.tpos)?;
+    winter.set_item("tneg", precip.tneg)?;
+    winter.set_item("ttop", precip.ttop)?;
+    winter.set_item("tbot", precip.tbot)?;
+    winter.set_item("wpos", precip.wpos)?;
+    winter.set_item("wneg", precip.wneg)?;
+    winter.set_item("wtop", precip.wtop)?;
+    winter.set_item("wbot", precip.wbot)?;
+    winter.set_item("precip_type", precip.precip_type)?;
     result.set_item("winter", winter)?;
     Ok(result)
 }
@@ -487,6 +875,8 @@ fn analysis_dict<'py>(
     profile: &Profile,
     derived: &DerivedParams,
     ecape: Option<EcapeResult>,
+    observed_wind_valid: Option<&[bool]>,
+    missing: f64,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
     result.set_item("schema", "sharpmod.native-analysis.v1")?;
@@ -514,7 +904,24 @@ fn analysis_dict<'py>(
     arrays.set_item("logp", &inner.logp)?;
     arrays.set_item("vtmp", &inner.vtmp)?;
     arrays.set_item("theta", &inner.theta)?;
-    arrays.set_item("thetae", &inner.thetae)?;
+    // sharprs::Profile caches a Bolton theta-e array, while SHARPpy's public
+    // BasicProfile contract uses its Wobus lift and stores kelvin.  The
+    // sharprs thermo function is the Wobus port; expose that reference array
+    // without changing internal algorithms that intentionally use Bolton.
+    let thetae: Vec<f64> = inner
+        .pres
+        .iter()
+        .zip(&inner.tmpc)
+        .zip(&inner.dwpc)
+        .map(|((&p, &t), &td)| {
+            if p.is_finite() && t.is_finite() && td.is_finite() {
+                thermo::thetae(p, t, td) + 273.15
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    arrays.set_item("thetae", thetae)?;
     arrays.set_item("wvmr", &inner.wvmr)?;
     arrays.set_item("relh", &inner.relh)?;
     arrays.set_item("wetbulb", &inner.wetbulb)?;
@@ -545,7 +952,10 @@ fn analysis_dict<'py>(
     parcels.set_item("effective", parcel_dict(py, &effective_parcel(profile))?)?;
     result.set_item("parcels", parcels)?;
     result.set_item("derived", derived_dict(py, derived)?)?;
-    result.set_item("extra", extra_dict(py, profile, derived)?)?;
+    result.set_item(
+        "extra",
+        extra_dict(py, profile, derived, observed_wind_valid, missing)?,
+    )?;
 
     let provenance = PyDict::new(py);
     provenance.set_item("profile", "sharprs-core")?;
@@ -585,6 +995,7 @@ fn analysis_dict<'py>(
     wdir,
     wspd,
     omeg=None,
+    observed_wind_valid=None,
     latitude=None,
     longitude=None,
     missing=-9999.0,
@@ -600,6 +1011,7 @@ fn analyze(
     wdir: Vec<f64>,
     wspd: Vec<f64>,
     omeg: Option<Vec<f64>>,
+    observed_wind_valid: Option<Vec<bool>>,
     latitude: Option<f64>,
     longitude: Option<f64>,
     missing: f64,
@@ -617,6 +1029,14 @@ fn analyze(
     {
         return Err(PyValueError::new_err(
             "omeg must be omitted or have the same length as pres",
+        ));
+    }
+    if observed_wind_valid
+        .as_ref()
+        .is_some_and(|values| values.len() != pres.len())
+    {
+        return Err(PyValueError::new_err(
+            "observed_wind_valid must be omitted or have the same length as pres",
         ));
     }
 
@@ -659,13 +1079,28 @@ fn analyze(
         if let Some(native) = ecape {
             // The authoritative vRust values come from the independently
             // parity-tested ecape-rs path, not sharppyrs' display formula.
-            derived.ecape = native.ecape;
-            derived.ncape = native.ncape;
+            // Keep the raw value in the dedicated `ecape` result for oracle
+            // comparisons, but enforce the public/display contract against
+            // the native most-unstable parcel CAPE.
+            derived.ecape = if profile.mupcl.bplus.is_finite() && profile.mupcl.bplus > 0.0 {
+                native.ecape.clamp(0.0, profile.mupcl.bplus)
+            } else {
+                0.0
+            };
         }
-        Ok::<_, String>((profile, derived, ecape))
+        Ok::<_, String>((profile, derived, ecape, observed_wind_valid, missing))
     });
-    let (profile, derived, ecape) = computed.map_err(PyRuntimeError::new_err)?;
-    Ok(analysis_dict(py, &profile, &derived, ecape)?.unbind())
+    let (profile, derived, ecape, observed_wind_valid, missing) =
+        computed.map_err(PyRuntimeError::new_err)?;
+    Ok(analysis_dict(
+        py,
+        &profile,
+        &derived,
+        ecape,
+        observed_wind_valid.as_deref(),
+        missing,
+    )?
+    .unbind())
 }
 
 #[pyfunction]
@@ -732,13 +1167,7 @@ fn lift_parcel(
         })
         .ok_or_else(|| "sharppyrs rejected the sounding input".to_string())?;
         let inner = &analyzed.inner;
-        let cape_profile = cape::Profile::new(
-            inner.pres.clone(),
-            inner.hght.clone(),
-            inner.tmpc.clone(),
-            inner.dwpc.clone(),
-            inner.sfc,
-        );
+        let cape_profile = sharppyrs::extras::cape_profile(inner);
         let level = LiftedParcelLevel {
             pres: parcel_pres,
             tmpc: parcel_tmpc,
@@ -749,10 +1178,58 @@ fn lift_parcel(
                 dwpc: parcel_dwpc,
             },
         };
-        Ok::<_, String>(parcelx(&cape_profile, &level, pbot, ptop))
+        Ok::<_, String>(sharppyrs::extras::parcelx_sharppy(
+            &cape_profile,
+            &level,
+            pbot,
+            ptop,
+        ))
     });
     let parcel = parcel.map_err(PyRuntimeError::new_err)?;
     Ok(parcel_dict(py, &parcel)?.unbind())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    height_msl_m,
+    u_kts,
+    v_kts,
+    sfc,
+    storm_u_kts,
+    storm_v_kts,
+    max_height_m=6000.0,
+    step_m=100.0,
+))]
+#[allow(clippy::too_many_arguments)]
+fn streamwiseness(
+    py: Python<'_>,
+    height_msl_m: Vec<f64>,
+    u_kts: Vec<f64>,
+    v_kts: Vec<f64>,
+    sfc: usize,
+    storm_u_kts: f64,
+    storm_v_kts: f64,
+    max_height_m: f64,
+    step_m: f64,
+) -> PyResult<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> {
+    if height_msl_m.len() != u_kts.len() || height_msl_m.len() != v_kts.len() {
+        return Err(PyValueError::new_err(
+            "height_msl_m, u_kts, and v_kts must have identical lengths",
+        ));
+    }
+    let result = py.allow_threads(move || {
+        streamwiseness_core(
+            &height_msl_m,
+            &u_kts,
+            &v_kts,
+            sfc,
+            storm_u_kts,
+            storm_v_kts,
+            max_height_m,
+            step_m,
+        )
+    });
+    Ok(result.map(|values| (values.height_m, values.percent, values.signed_percent)))
 }
 
 #[pyfunction]
@@ -770,8 +1247,9 @@ fn backend_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     )?;
     result.set_item(
         "ecape_rs_revision",
-        "82922534c02a888e773c50463b5a49d535606276",
+        "414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0",
     )?;
+    result.set_item("streamwiseness", "rust")?;
     result.set_item("gil_released", true)?;
     Ok(result.unbind())
 }
@@ -811,6 +1289,85 @@ fn best_guess_precip(
         negative_area,
         surface_temp_c,
     ))
+}
+
+/// Literal `sharppy.sharptab.watch_type.possible_watch` priority semantics.
+///
+/// The upstream Rust port intentionally corrected the Python routine's final
+/// marginal-tornado operator precedence and its historical heat-index RH
+/// unit mix-up. This bridge promises SHARPpy equivalence, so preserve those
+/// established classifier results here instead of silently changing labels.
+fn legacy_best_watch(p: &WatchParams) -> &'static str {
+    if p.stp_eff >= 3.0
+        && p.stp_fixed >= 3.0
+        && p.srh1km >= 200.0
+        && p.esrh >= 200.0
+        && p.srw_4_6km >= 15.0
+        && p.sfc_8km_shear > 45.0
+        && p.sfcpcl_lclhght < 1000.0
+        && p.mlpcl_lclhght < 1200.0
+        && p.lr1 >= 5.0
+        && p.mlpcl_bminus > -50.0
+        && p.ebotm == 0.0
+    {
+        return "PDS TOR";
+    }
+    if (p.stp_eff >= 3.0 || p.stp_fixed >= 4.0) && p.mlpcl_bminus > -125.0 && p.ebotm == 0.0 {
+        return "TOR";
+    }
+    if (p.stp_eff >= 1.0 || p.stp_fixed >= 1.0)
+        && (p.srw_4_6km >= 15.0 || p.sfc_8km_shear >= 40.0)
+        && p.mlpcl_bminus > -50.0
+        && p.ebotm == 0.0
+    {
+        return "TOR";
+    }
+    if (p.stp_eff >= 1.0 || p.stp_fixed >= 1.0)
+        && (p.low_rh + p.mid_rh) / 2.0 >= 60.0
+        && p.lr1 >= 5.0
+        && p.mlpcl_bminus > -50.0
+        && p.ebotm == 0.0
+    {
+        return "TOR";
+    }
+    if (p.stp_eff >= 1.0 || p.stp_fixed >= 1.0) && p.mlpcl_bminus > -150.0 && p.ebotm == 0.0 {
+        return "MRGL TOR";
+    }
+    // Python's `and` binds more tightly than `or`: the CIN/surface gates
+    // apply only to the fixed-STP arm of this particular condition.
+    if (p.stp_eff >= 0.5 && p.esrh >= 150.0)
+        || (p.stp_fixed >= 0.5 && p.srh1km >= 150.0 && p.mlpcl_bminus > -50.0 && p.ebotm == 0.0)
+    {
+        return "MRGL TOR";
+    }
+
+    if (p.stp_fixed >= 1.0 || p.scp >= 4.0 || p.stp_eff >= 1.0) && p.mupcl_bminus >= -50.0 {
+        return "SVR";
+    }
+    if p.scp >= 2.0 && (p.ship >= 1.0 || p.dcape >= 750.0) && p.mupcl_bminus >= -50.0 {
+        return "SVR";
+    }
+    if p.sig_severe >= 30_000.0 && p.mmp >= 0.6 && p.mupcl_bminus >= -50.0 {
+        return "SVR";
+    }
+    if p.mupcl_bminus >= -75.0 && (p.wndg >= 0.5 || p.ship >= 0.5 || p.scp >= 0.5) {
+        return "MRGL SVR";
+    }
+    if p.pwv_flag >= 2 && p.upshear_wspd < 25.0 {
+        return "FLASH FLOOD";
+    }
+    if p.sfc_wspd_kts * 1.150_78 > 35.0 && p.sfc_tmpc <= 0.0 && p.precip_type.contains("Snow") {
+        return "BLIZZARD";
+    }
+
+    let temp_f = thermo::ctof(p.sfc_tmpc);
+    // Preserve SHARPpy's historical call, which passes Fahrenheit `temp_f`
+    // alongside a Celsius dewpoint to thermo.relh.
+    let rh = thermo::relh(p.sfc_pres, temp_f, p.sfc_dwpc);
+    if watch_type::heat_index(temp_f, rh) > 105.0 {
+        return "EXCESSIVE HEAT";
+    }
+    "NONE"
 }
 
 #[pyfunction]
@@ -863,17 +1420,77 @@ fn classify_watch(values: &Bound<'_, PyDict>) -> PyResult<&'static str> {
         sfc_wspd_kts: get_f64("sfc_wspd_kts")?,
         precip_type: get_string("precip_type")?,
     };
-    Ok(watch_type::best_watch(&params).label())
+    Ok(legacy_best_watch(&params))
 }
 
 #[pymodule]
 fn sharpmod_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(analyze, module)?)?;
     module.add_function(wrap_pyfunction!(lift_parcel, module)?)?;
+    module.add_function(wrap_pyfunction!(streamwiseness, module)?)?;
     module.add_function(wrap_pyfunction!(backend_info, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_check, module)?)?;
     module.add_function(wrap_pyfunction!(best_guess_precip, module)?)?;
     module.add_function(wrap_pyfunction!(classify_watch, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamwiseness_squares_the_signed_projection_ratio() {
+        // omega=(3,4)*1e-3 has magnitude 5e-3. Construct a unit storm-
+        // relative vector whose projection on omega is exactly half of that
+        // magnitude: the corrected squared definition is 25%, not 50%.
+        let root_three_over_two = (0.75_f64).sqrt();
+        let sr_u_ms = 0.5 * 0.6 + root_three_over_two * -0.8;
+        let sr_v_ms = 0.5 * 0.8 + root_three_over_two * 0.6;
+        let result = streamwiseness_core(
+            &[0.0, 100.0],
+            &[0.0, 0.4 / KTS_TO_MS],
+            &[0.0, -0.3 / KTS_TO_MS],
+            0,
+            -sr_u_ms / KTS_TO_MS,
+            -sr_v_ms / KTS_TO_MS,
+            100.0,
+            100.0,
+        )
+        .expect("3-4-5 vorticity profile should be usable");
+        assert!((result.percent[0] - 25.0).abs() < 1.0e-10);
+        assert!((result.signed_percent[0] - 25.0).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn streamwiseness_normalizes_levels_and_rejects_zero_vorticity() {
+        let normalized = streamwiseness_core(
+            &[999.0, 1300.0, 1100.0, 1100.0, f64::NAN],
+            &[0.0, 3.0, 1.0, 99.0, 0.0],
+            &[0.0, 0.0, 0.0, 99.0, 0.0],
+            0,
+            0.0,
+            -10.0,
+            250.0,
+            100.0,
+        )
+        .expect("sorted, deduplicated profile should be usable");
+        assert_eq!(normalized.height_m, vec![0.0, 100.0, 200.0]);
+        assert!(normalized.percent.iter().all(|value| value.is_finite()));
+
+        assert!(
+            streamwiseness_core(
+                &[0.0, 100.0],
+                &[1.0, 1.0],
+                &[2.0, 2.0],
+                0,
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+            )
+            .is_none()
+        );
+    }
 }

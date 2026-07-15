@@ -465,7 +465,20 @@ The streamwiseness panel interpolates winds to a 100-m AGL grid through at most 
 \frac{\partial u}{\partial z}\right),
 ```
 
-then projects it onto storm-relative flow. The absolute projection ratio is clipped to 0–100 percent, while the signed value distinguishes positive/cyclonic (red) from negative/anticyclonic (blue). A point is usable only when vorticity magnitude exceeds $10^{-6}$ per second and storm-relative speed exceeds 0.1 m/s.
+then projects it onto the storm-relative wind unit vector. The displayed
+streamwiseness magnitude uses the corrected squared projection ratio:
+
+```math
+\mathrm{Streamwiseness}
+=\left(\frac{\omega_{streamwise}}{\lVert\vec\omega_h\rVert}\right)^2
+\times 100\%.
+```
+
+The sign of $\omega_{streamwise}$ is retained only to select directional
+shading: positive/cyclonic is red and negative/anticyclonic is blue. It does
+not change the non-negative plotted magnitude. The result is clipped to
+0–100 percent. A point is usable only when vorticity magnitude exceeds
+$10^{-6}$ per second and storm-relative speed exceeds 0.1 m/s.
 
 ## Other custom and specialty parameters
 

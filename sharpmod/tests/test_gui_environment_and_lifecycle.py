@@ -209,7 +209,7 @@ def test_in_place_model_refresh_updates_index_board(monkeypatch):
     assert calls == [(prof, derived)]
 
 
-def test_existing_model_viewer_turns_map_click_into_debounced_fetch():
+def test_cached_model_hour_turns_map_click_into_debounced_load():
     class Spin:
         def __init__(self):
             self.value = None
@@ -220,6 +220,10 @@ def test_existing_model_viewer_turns_map_click_into_debounced_fetch():
     class Timer:
         def __init__(self):
             self.started = False
+            self.interval = None
+
+        def setInterval(self, interval):  # noqa: N802
+            self.interval = interval
 
         def start(self):
             self.started = True
@@ -234,7 +238,7 @@ def test_existing_model_viewer_turns_map_click_into_debounced_fetch():
         def _model_update_fetch_state(self):
             self.updated = True
 
-        def _model_viewer_is_open(self):
+        def _model_selected_hour_is_cached(self):
             return True
 
     picker = Picker()
@@ -243,6 +247,7 @@ def test_existing_model_viewer_turns_map_click_into_debounced_fetch():
     assert picker._model_lat.value == 35.25
     assert picker._model_lon.value == -97.50
     assert picker._model_click_timer.started is True
+    assert picker._model_click_timer.interval == 40
 
 
 def test_deferred_spc_construction_realizes_layout_offscreen(monkeypatch):

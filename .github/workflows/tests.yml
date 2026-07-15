@@ -36,8 +36,10 @@ jobs:
           ref: ${{ env.SHARPPYRS_REV }}
           path: native/sharppyrs
 
-      - name: Apply v0.3.1 ECAPE upper-bound fix
-        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+      - name: Apply pinned sharppyrs parity fixes
+        run: |
+          git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+          git -C native/sharppyrs apply ../patches/sharppyrs-sharppy-parity.patch
 
       - name: Install Qt runtime libraries
         run: |

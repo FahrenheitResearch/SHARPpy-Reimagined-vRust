@@ -454,6 +454,10 @@ def derived_profile_from(prof, *, warm=()):
             if source not in values:
                 continue
             value = values[source]
+            if attr == "shear_sfc_500m" and isinstance(value, (list, tuple)):
+                # The native schema carries the u/v shear vector, whereas the
+                # display companion's public contract is scalar speed (kt).
+                value = float(np.hypot(*value))
             if is_missing(value):
                 if attr == "modified_sherbe":
                     # MOSHE requires an OMEGA profile. Rusty Weather point

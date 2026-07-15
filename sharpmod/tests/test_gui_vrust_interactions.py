@@ -27,6 +27,10 @@ class _Timer:
     def __init__(self):
         self.started = 0
         self.stopped = 0
+        self.intervals = []
+
+    def setInterval(self, interval):  # noqa: N802
+        self.intervals.append(interval)
 
     def start(self):
         self.started += 1
@@ -55,12 +59,16 @@ class _Button:
     def __init__(self):
         self.enabled = False
         self.label = ""
+        self.tooltip = ""
 
     def setEnabled(self, enabled):  # noqa: N802
         self.enabled = bool(enabled)
 
     def setText(self, label):  # noqa: N802
         self.label = label
+
+    def setToolTip(self, text):  # noqa: N802
+        self.tooltip = text
 
 
 class _StatusBar:
@@ -231,7 +239,7 @@ def test_file_filter_and_drop_target_the_real_open_file_tab():
     assert picker.opened == "example.OAX"
 
 
-def test_map_click_autofetches_only_after_a_model_viewer_exists():
+def test_cached_map_click_opens_first_viewer_and_refreshes_later_clicks():
     timer = _Timer()
     picker = SimpleNamespace(
         _model_syncing_point=False,
@@ -240,21 +248,64 @@ def test_map_click_autofetches_only_after_a_model_viewer_exists():
         _model_worker=None,
         _model_click_timer=timer,
         _model_update_fetch_state=lambda: None,
-        _model_viewer_is_open=lambda: False,
+        _model_selected_hour_is_cached=lambda: True,
     )
 
     gui_picker.PickerWindow._model_on_map_point(picker, 35.25, -97.5)
-    assert timer.started == 0
+    assert timer.started == 1
+    assert timer.intervals == [gui_picker._CACHED_MODEL_CLICK_DEBOUNCE_MS]
 
-    picker._model_viewer_is_open = lambda: True
     gui_picker.PickerWindow._model_on_map_point(picker, 35.5, -97.25)
 
-    assert timer.started == 1
+    assert timer.started == 2
+    assert timer.intervals == [
+        gui_picker._CACHED_MODEL_CLICK_DEBOUNCE_MS,
+        gui_picker._CACHED_MODEL_CLICK_DEBOUNCE_MS,
+    ]
     assert picker._model_lat.value == 35.5
     assert picker._model_lon.value == -97.25
 
 
-def test_double_click_cancels_debounce_and_fetches_once():
+def test_uncached_first_map_click_only_selects_coordinates():
+    timer = _Timer()
+    picker = SimpleNamespace(
+        _model_syncing_point=False,
+        _model_lat=_Spin(),
+        _model_lon=_Spin(),
+        _model_worker=None,
+        _model_click_timer=timer,
+        _model_update_fetch_state=lambda: None,
+        _model_selected_hour_is_cached=lambda: False,
+        _model_viewer_is_open=lambda: False,
+    )
+
+    gui_picker.PickerWindow._model_on_map_point(picker, 35.25, -97.5)
+
+    assert timer.started == 0
+    assert picker._model_lat.value == 35.25
+    assert picker._model_lon.value == -97.5
+
+
+def test_uncached_map_click_refreshes_an_existing_viewer():
+    timer = _Timer()
+    picker = SimpleNamespace(
+        _model_syncing_point=False,
+        _model_lat=_Spin(),
+        _model_lon=_Spin(),
+        _model_worker=None,
+        _model_click_timer=timer,
+        _model_update_fetch_state=lambda: None,
+        _model_selected_hour_is_cached=lambda: False,
+        _model_viewer_is_open=lambda: True,
+    )
+
+    gui_picker.PickerWindow._model_on_map_point(picker, 35.25, -97.5)
+
+    assert timer.started == 1
+    assert timer.intervals == [gui_picker._MODEL_CLICK_DEBOUNCE_MS]
+
+
+def test_double_click_cancels_debounce_and_explicitly_fetches_once():
     timer = _Timer()
     calls = []
     picker = SimpleNamespace(
@@ -266,6 +317,92 @@ def test_double_click_cancels_debounce_and_fetches_once():
 
     assert timer.stopped == 1
     assert calls == ["fetch"]
+
+
+@pytest.mark.parametrize(
+    ("cached", "viewer_open", "expected"),
+    [(False, False, []), (True, False, ["fetch"]),
+     (False, True, ["fetch"])],
+)
+def test_map_dispatch_requires_cached_hour_or_existing_viewer(
+        cached, viewer_open, expected):
+    calls = []
+    picker = SimpleNamespace(
+        _model_selected_hour_is_cached=lambda: cached,
+        _model_viewer_is_open=lambda: viewer_open,
+        _model_fetch=lambda: calls.append("fetch"),
+    )
+
+    gui_picker.PickerWindow._model_dispatch_map_click(picker)
+
+    assert calls == expected
+
+
+def test_cached_map_click_check_uses_exact_selected_hour(monkeypatch):
+    from sharpmod.tools import rusty_weather
+
+    run = datetime(2026, 7, 15, 0, tzinfo=timezone.utc)
+    calls = []
+    cfg = SimpleNamespace(key="hrrr")
+    picker = SimpleNamespace(
+        _model_config=lambda: cfg,
+        _model_run_time=lambda: run,
+        _model_selected_fxx=lambda: 4,
+    )
+    monkeypatch.setattr(rusty_weather, "is_available", lambda model: True)
+    monkeypatch.setattr(
+        rusty_weather, "hour_is_cached",
+        lambda model, selected_run, fxx:
+        calls.append((model, selected_run, fxx)) or True)
+
+    cached = gui_picker.PickerWindow._model_selected_hour_is_cached(picker)
+
+    assert cached is True
+    assert calls == [("hrrr", run, 4)]
+
+
+def test_cached_selection_labels_local_display_as_no_download():
+    point_status = _Button()
+    fetch = _Button()
+    cache = _Button()
+    cfg = SimpleNamespace(key="hrrr", label="HRRR", domain="CONUS")
+    picker = SimpleNamespace(
+        _model_fetch_btn=fetch,
+        _model_cache_btn=cache,
+        _model_point_status=point_status,
+        _model_config=lambda: cfg,
+        _model_is_busy=lambda: False,
+        _model_lat=SimpleNamespace(value=lambda: 35.25),
+        _model_lon=SimpleNamespace(value=lambda: -97.5),
+        _model_point_ok=lambda: True,
+        _model_selected_hour_is_cached=lambda: True,
+        _model_cache_availability=lambda _cfg: (True, "cache it"),
+    )
+
+    gui_picker.PickerWindow._model_update_fetch_state(picker)
+
+    assert fetch.label == "Display Cached Forecast Sounding"
+    assert "No download" in fetch.tooltip
+    assert cache.enabled is False
+    assert "Click Map to Display" in cache.label
+    assert "no download" in point_status.label
+
+
+def test_valid_time_change_refreshes_cached_state_labels():
+    calls = []
+    label = _Button()
+    run = datetime(2026, 7, 15, 0, tzinfo=timezone.utc)
+    picker = SimpleNamespace(
+        _model_valid_lbl=label,
+        _model_run_time=lambda: run,
+        _model_selected_fxx=lambda: 4,
+        _model_update_fetch_state=lambda: calls.append("refresh"),
+    )
+
+    gui_picker.PickerWindow._model_update_valid_label(picker)
+
+    assert "Valid 2026-07-15 04Z" in label.label
+    assert calls == ["refresh"]
 
 
 def test_native_hour_cache_worker_reports_progress_and_result(

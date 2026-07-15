@@ -446,18 +446,12 @@ class IndexBoard(QFrame):
         return QtGui.QColor(colors.sweat_color(v))
 
     def _sweat(self):
-        # SWEAT is not stored on the analyzed profile; compute it on demand
-        # from the SHARPpy params helper. Guarded so a missing input or an
-        # unavailable sharppy install never breaks the board.
+        # The native bulk analysis already owns the authoritative SWEAT value.
+        # Reading it from the analyzed profile avoids repeating the complete
+        # legacy Python calculation every time this board is repainted.
         if getattr(self, "_sweat_cache", "unset") != "unset":
             return self._sweat_cache
-        val = None
-        if self.sp is not None:
-            try:
-                import sharppy.sharptab.params as _params
-                val = _f(_params.sweat(self.sp))
-            except Exception:
-                val = None
+        val = _f(getattr(self.sp, "sweat", None))
         self._sweat_cache = val
         return val
 

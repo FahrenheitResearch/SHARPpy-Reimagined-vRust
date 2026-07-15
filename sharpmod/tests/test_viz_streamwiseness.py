@@ -12,7 +12,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from qtpy import QtCore, QtGui, QtWidgets
 
-from sharpmod.viz.streamwiseness import plotStreamwiseness, streamwiseness_profile
+from sharpmod.sharptab import native_analysis
+from sharpmod.viz.streamwiseness import (
+    KTS_TO_MS,
+    _python_streamwiseness_profile,
+    plotStreamwiseness,
+    streamwiseness_profile,
+)
 
 
 @pytest.fixture(scope="module")
@@ -48,6 +54,25 @@ def _representative_profile():
     )
 
 
+def _half_streamwise_profile():
+    """Two-level profile whose surface projection ratio is exactly 0.5."""
+    root_three_over_two = np.sqrt(0.75)
+    sr_u_ms = 0.5 * 0.6 + root_three_over_two * -0.8
+    sr_v_ms = 0.5 * 0.8 + root_three_over_two * 0.6
+    return SimpleNamespace(
+        hght=np.array([0.0, 100.0]),
+        u=np.array([0.0, 0.4 / KTS_TO_MS]),
+        v=np.array([0.0, -0.3 / KTS_TO_MS]),
+        sfc=0,
+        srwind=(
+            -sr_u_ms / KTS_TO_MS,
+            -sr_v_ms / KTS_TO_MS,
+            -sr_u_ms / KTS_TO_MS,
+            -sr_v_ms / KTS_TO_MS,
+        ),
+    )
+
+
 def _mixed_sign_profile():
     height = np.arange(0.0, 6000.0 + 250.0, 250.0)
     phase = np.where(
@@ -78,6 +103,52 @@ def test_streamwiseness_profile_preserves_anticyclonic_sign():
     assert result is not None
     assert np.nanmean(result.percent[1:-1]) > 98.0
     assert np.all(result.signed_percent[1:-1] < 0.0)
+
+
+def test_corrected_definition_squares_half_projection_to_25_percent():
+    native = streamwiseness_profile(_half_streamwise_profile())
+    fallback = _python_streamwiseness_profile(_half_streamwise_profile())
+
+    assert native is not None
+    assert native.backend == "rust"
+    assert fallback is not None
+    assert fallback.backend == "python-fallback"
+    assert native.percent[0] == pytest.approx(25.0, abs=1.0e-10)
+    assert fallback.percent[0] == pytest.approx(25.0, abs=1.0e-10)
+    assert native.signed_percent[0] == pytest.approx(25.0, abs=1.0e-10)
+
+
+@pytest.mark.parametrize("use_left", [False, True])
+def test_native_and_python_fallback_streamwiseness_match(use_left):
+    prof = _representative_profile()
+    native = streamwiseness_profile(prof, use_left=use_left)
+    fallback = _python_streamwiseness_profile(prof, use_left=use_left)
+
+    assert native is not None
+    assert native.backend == "rust"
+    assert fallback is not None
+    np.testing.assert_allclose(native.height_km, fallback.height_km)
+    np.testing.assert_allclose(
+        native.percent, fallback.percent, rtol=1.0e-12, atol=1.0e-12,
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        native.signed_percent, fallback.signed_percent,
+        rtol=1.0e-12, atol=1.0e-12, equal_nan=True,
+    )
+
+
+def test_python_fallback_is_used_only_when_native_feature_is_unavailable(
+        monkeypatch):
+    def unavailable(*_args, **_kwargs):
+        raise native_analysis.NativeAnalysisUnavailable("test")
+
+    monkeypatch.setattr(native_analysis, "streamwiseness", unavailable)
+    result = streamwiseness_profile(_half_streamwise_profile())
+
+    assert result is not None
+    assert result.backend == "python-fallback"
+    assert result.percent[0] == pytest.approx(25.0, abs=1.0e-10)
 
 
 def test_streamwiseness_profile_returns_none_without_storm_motion():
@@ -136,7 +207,7 @@ def test_plot_streamwiseness_draws_reference_labels_and_both_sign_fills(qt_app):
     qt_app.processEvents()
 
     assert "Streamwiseness" in labels
-    assert "Streamwiseness (%)" in labels
+    assert "Squared ratio (%)" in labels
     assert "Height AGL (km)" in labels
     assert "Cyclonic" in labels
     assert "Anticyclonic" in labels

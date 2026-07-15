@@ -1,0 +1,1681 @@
+diff --git a/src/derived.rs b/src/derived.rs
+index 32b1996ae1ffe6680fd817fed95cc0f89a70a7b2..4bf264dd1d3f68f8a21471fd550a253c0118baee 100644
+--- a/src/derived.rs
++++ b/src/derived.rs
+@@ -6,15 +6,17 @@
+ //! Golden reference for every field: `testdata/golden_full.json` (generated
+ //! by running the actual Python stack on the bundled example sounding).
+ 
+-use sharprs::params::cape::{self, LiftedParcelLevel, ParcelResult, ParcelType as SharprsParcelType};
++use sharprs::params::cape::{
++    self, LiftedParcelLevel, ParcelResult, ParcelType as SharprsParcelType,
++};
+ use sharprs::params::{composites, indices};
+ use sharprs::profile::comp2vec;
+ use sharprs::thermo;
+ use sharprs::utils::kts2ms;
+ use sharprs::winds;
+ 
+-use crate::utils::qc;
+ use crate::Profile;
++use crate::utils::qc;
+ 
+ /// `(u, v)` kts.
+ pub type Comp = (f64, f64);
+@@ -298,11 +300,9 @@ impl DerivedParams {
+         d.wind1km = inner.interp_vec(p1km);
+         d.wind6km = inner.interp_vec(p6km);
+ 
+-        // sharpmod's SFC-500 m storm-relative mean wind uses the *non-parcel*
+-        // Bunkers right mover (the sharpmod Profile carries no srwind).
+-        let npb = winds::non_parcel_bunkers_motion(inner)
+-            .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+-        d.srw_sfc_500m = mean_wind(inner, sfc_pres, p500m, npb.0, npb.1);
++        // Full ConvectiveProfile semantics use the profile's active Bunkers
++        // storm motion for both SFC-500 m storm-relative diagnostics.
++        d.srw_sfc_500m = mean_wind(inner, sfc_pres, p500m, rstu, rstv);
+ 
+         // --- helicity ------------------------------------------------------
+         d.srh500 = helicity(inner, 0.0, 500.0, rstu, rstv);
+@@ -320,7 +320,13 @@ impl DerivedParams {
+             d.corfidi_up = (upu, upv);
+             d.corfidi_dn = (dnu, dnv);
+         }
+-        d.right_critical_angle = winds::critical_angle(inner, rstu, rstv).unwrap_or(f64::NAN);
++        // ConvectiveProfile publishes critical angle only when an effective
++        // inflow layer exists; the same storm motion remains valid for the
++        // fixed-layer diagnostics above when no effective layer is found.
++        if qc(prof.ebottom) && qc(prof.etop) {
++            d.right_critical_angle =
++                winds::critical_angle(inner, rstu, rstv).unwrap_or(f64::NAN);
++        }
+         // Port of `params.bulk_rich` (MU parcel branch: sfc..6 km layer).
+         {
+             let pblw = inner.pres_at_height(inner.sfc_height() + 500.0);
+@@ -396,19 +402,15 @@ impl DerivedParams {
+         }
+ 
+         // --- lapse rates ----------------------------------------------------
+-        d.lapserate_3km = indices::lapse_rate(inner, 0.0, 3000.0, false).unwrap_or(f64::NAN);
+-        d.lapserate_3_6km =
+-            indices::lapse_rate(inner, 3000.0, 6000.0, false).unwrap_or(f64::NAN);
+-        d.lapserate_850_500 =
+-            indices::lapse_rate(inner, 850.0, 500.0, true).unwrap_or(f64::NAN);
+-        d.lapserate_700_500 =
+-            indices::lapse_rate(inner, 700.0, 500.0, true).unwrap_or(f64::NAN);
+-        // Virtual-temperature lapse rates, matching the SHARPpy convention of
+-        // the other rows in the lapse-rate box. (sharpmod's own SFC-500m /
+-        // SFC-1km rows use plain temperature — a quirk deliberately NOT
+-        // reproduced; the vtmp values are the meteorologically standard ones.)
+-        d.lapserate_sfc_500m = crate::extras::lapse_rate_agl(inner, 0.0, 500.0);
+-        d.lapserate_sfc_1km = crate::extras::lapse_rate_agl(inner, 0.0, 1000.0);
++        d.lapserate_3km = crate::extras::lapse_rate_agl(inner, 0.0, 3000.0);
++        d.lapserate_3_6km = crate::extras::lapse_rate_agl(inner, 3000.0, 6000.0);
++        d.lapserate_850_500 = indices::lapse_rate(inner, 850.0, 500.0, true).unwrap_or(f64::NAN);
++        d.lapserate_700_500 = indices::lapse_rate(inner, 700.0, 500.0, true).unwrap_or(f64::NAN);
++        // The local sharpmod companion established these two shallow rows
++        // with plain temperature rather than SHARPpy's general vtmp lapse
++        // rate. Preserve that public display contract.
++        d.lapserate_sfc_500m = crate::extras::temperature_lapse_rate_agl(inner, 0.0, 500.0);
++        d.lapserate_sfc_1km = crate::extras::temperature_lapse_rate_agl(inner, 0.0, 1000.0);
+ 
+         // --- DCAPE / downrush -----------------------------------------------
+         // Display convention is SHARPpy's (positive J/kg).
+@@ -439,8 +441,8 @@ impl DerivedParams {
+             let mw = kts2ms(mag_c(mean_wind(inner, p1km, p3_5km, 0.0, 0.0)));
+             composites::wndg(mlpcl.bplus, d.lapserate_3km, mw, mlpcl.bminus).unwrap_or(f64::NAN)
+         };
+-        d.dcp = composites::dcp(d.dcape, mupcl.bplus, shr06_kt, mag_c(mean_6km))
+-            .unwrap_or(f64::NAN);
++        d.dcp =
++            composites::dcp(d.dcape, mupcl.bplus, shr06_kt, mag_c(mean_6km)).unwrap_or(f64::NAN);
+         d.sig_severe = composites::sig_severe(mlpcl.bplus, shr06_ms).unwrap_or(f64::NAN);
+         d.ship = {
+             let mumr = thermo::mixratio(mupcl.pres, mupcl.dwpc);
+@@ -450,30 +452,55 @@ impl DerivedParams {
+                 .map(|p| inner.interp_hght(p))
+                 .unwrap_or(f64::NAN);
+             let h5 = inner.interp_tmpc(500.0);
+-            composites::ship(mupcl.bplus, mumr, d.lapserate_700_500, h5, shr06_ms, frz_lvl)
+-                .unwrap_or(f64::NAN)
++            composites::ship(
++                mupcl.bplus,
++                mumr,
++                d.lapserate_700_500,
++                h5,
++                shr06_ms,
++                frz_lvl,
++            )
++            .unwrap_or(f64::NAN)
+         };
+         if qc(prof.ebottom) && qc(prof.etop) {
+             let ebwd_ms = kts2ms(ebwspd);
+-            d.right_scp =
+-                composites::scp(mupcl.bplus, d.right_esrh, ebwd_ms).unwrap_or(f64::NAN);
++            d.right_scp = composites::scp(mupcl.bplus, d.right_esrh, ebwd_ms).unwrap_or(f64::NAN);
+             d.left_scp = composites::scp(mupcl.bplus, left_esrh, ebwd_ms).unwrap_or(f64::NAN);
+-            d.stp_cin = composites::stp_cin(
+-                mlpcl.bplus,
+-                d.right_esrh,
+-                ebwd_ms,
+-                mlpcl.lclhght,
+-                mlpcl.bminus,
+-            )
+-            .unwrap_or(f64::NAN);
++            let stp_esrh = if prof.latitude() < 0.0 {
++                -left_esrh
++            } else {
++                d.right_esrh
++            };
++            d.stp_cin =
++                composites::stp_cin(mlpcl.bplus, stp_esrh, ebwd_ms, mlpcl.lclhght, mlpcl.bminus)
++                    .unwrap_or(f64::NAN);
++            if prof.latitude() < 0.0 {
++                d.stp_cin = -d.stp_cin;
++            }
+         } else {
+             d.right_scp = 0.0;
+             d.left_scp = 0.0;
+             d.stp_cin = 0.0;
+         }
+-        d.stp_fixed =
+-            composites::stp_fixed(sfcpcl.bplus, sfcpcl.lclhght, d.srh1km, shr06_ms)
+-                .unwrap_or(f64::NAN);
++        let fixed_srh = if prof.latitude() < 0.0 {
++            helicity(inner, 0.0, 1000.0, lstu, lstv)
++        } else {
++            d.srh1km
++        };
++        d.stp_fixed = composites::stp_fixed(sfcpcl.bplus, sfcpcl.lclhght, fixed_srh, shr06_ms)
++            .unwrap_or(f64::NAN);
++        // With a constant wind column, Bunkers' deviation vector is
++        // undefined (0/0). NumPy's legacy helicity path sums the resulting
++        // empty positive/negative layer selections to zero, which makes all
++        // shear/SRH severe composites exactly zero. Preserve that externally
++        // visible result while leaving genuinely absent winds missing.
++        let constant_wind = crate::extras::has_constant_wind(inner);
++        if constant_wind {
++            d.right_scp = 0.0;
++            d.left_scp = 0.0;
++            d.stp_cin = if prof.latitude() < 0.0 { -0.0 } else { 0.0 };
++            d.stp_fixed = 0.0;
++        }
+         d.sweat = {
+             let td850 = inner.interp_dwpc(850.0);
+             let (dir850, spd850) = inner.interp_vec(850.0);
+@@ -506,8 +533,7 @@ impl DerivedParams {
+         d.mmp = if qc(mupcl.bplus) && mupcl.bplus < 100.0 {
+             0.0
+         } else {
+-            composites::mmp(mupcl.bplus, mmp_shear_ms, lr38, mnwind_3_12_ms)
+-                .unwrap_or(f64::NAN)
++            composites::mmp(mupcl.bplus, mmp_shear_ms, lr38, mnwind_3_12_ms).unwrap_or(f64::NAN)
+         };
+         // MCS index = the Coniglio regression's linear predictor (sharpmod
+         // `derived.mcs_index`), using the max shear over *all* level pairs.
+@@ -518,11 +544,17 @@ impl DerivedParams {
+             + (-0.17 * mnwind_3_12_ms);
+ 
+         // --- SHARPpy-Reimagined derived composites --------------------------
+-        // EHI (sharpmod `derived.ehi`): SBCAPE x SRH with the *non-parcel*
++        // LRGHAIL's lightweight compatibility oracle explicitly uses
++        // non-parcel Bunkers motion. EHI, however, reuses ``prof.srwind`` when
++        // a full ConvectiveProfile has already established parcel Bunkers
++        // motion, so its authoritative full-profile result uses rstu/rstv.
++        let npb = winds::non_parcel_bunkers_motion(inner)
++            .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
++        // EHI (sharpmod `derived.ehi`): SBCAPE x SRH with the active cached
+         // Bunkers right mover.
+-        d.ehi_0_1km = composites::ehi(sfcpcl.bplus, helicity(inner, 0.0, 1000.0, npb.0, npb.1))
++        d.ehi_0_1km = composites::ehi(sfcpcl.bplus, helicity(inner, 0.0, 1000.0, rstu, rstv))
+             .unwrap_or(f64::NAN);
+-        d.ehi_0_3km = composites::ehi(sfcpcl.bplus, helicity(inner, 0.0, 3000.0, npb.0, npb.1))
++        d.ehi_0_3km = composites::ehi(sfcpcl.bplus, helicity(inner, 0.0, 3000.0, rstu, rstv))
+             .unwrap_or(f64::NAN);
+         // VGP (sharpmod): sqrt(SBCAPE) * (0-4 km shear [m/s] / 4000 m).
+         d.vgp = {
+@@ -575,9 +607,13 @@ impl DerivedParams {
+             )
+         };
+         // LSCP (sharpmod `derived.left_supercell_composite`).
+-        d.lscp = if !qc(prof.ebottom) || !qc(prof.etop) {
++        d.lscp = if constant_wind {
++            0.0
++        } else if !qc(prof.ebottom) || !qc(prof.etop) {
+             0.0
+-        } else if !qc(mupcl.bplus) || !qc(mupcl.bminus) || !left_esrh.is_finite()
++        } else if !qc(mupcl.bplus)
++            || !qc(mupcl.bminus)
++            || !left_esrh.is_finite()
+             || !ebwspd.is_finite()
+         {
+             f64::NAN
+@@ -627,7 +663,16 @@ impl DerivedParams {
+         };
+         d.wbz_height = indices::wet_bulb_zero(inner).unwrap_or(f64::NAN);
+         d.ecape = ecape(inner, mupcl);
+-        d.modified_sherbe = modified_sherbe(inner, d.lapserate_3km, p1_5km, ebwspd);
++        // The established sharpmod MOSHE formula reads ConvectiveProfile's
++        // literal MISSING ebwspd sentinel when no effective layer exists.
++        // Preserve that public legacy result (often a finite negative value)
++        // while keeping all other no-layer effective fields unavailable.
++        let moshe_ebwspd = if !qc(prof.ebottom) || !qc(prof.etop) {
++            -9999.0
++        } else {
++            ebwspd
++        };
++        d.modified_sherbe = modified_sherbe(inner, d.lapserate_3km, p1_5km, moshe_ebwspd);
+ 
+         // --- strips / insets -------------------------------------------------
+         let (temp_adv, bounds) = inferred_temp_adv(inner);
+@@ -666,6 +711,15 @@ fn mean_wind(inner: &sharprs::Profile, pbot: f64, ptop: f64, stu: f64, stv: f64)
+     if !qc(pbot) || !qc(ptop) || !qc(stu) || !qc(stv) {
+         return (f64::NAN, f64::NAN);
+     }
++    // SHARPpy samples with `np.arange(pbot, ptop - 1, -1)`.  When an
++    // effective-inflow layer contains exactly one pressure level, that grid
++    // contains only `pbot`; sharprs's inclusive loop also sampled `ptop - 1`
++    // and biased the mean (and both storm-relative means) toward the next
++    // level above it.
++    if (pbot - ptop).abs() <= 1.0e-9 {
++        let (u, v) = inner.interp_wind(pbot);
++        return (u - stu, v - stv);
++    }
+     winds::mean_wind(inner, pbot, ptop, -1.0, stu, stv).unwrap_or((f64::NAN, f64::NAN))
+ }
+ 
+@@ -732,26 +786,39 @@ fn layer_cape(cape_prof: &cape::Profile, inner: &sharprs::Profile, pbot: f64, pt
+         return f64::NAN;
+     }
+     let lpl = user_lpl(inner.sfc_pressure(), tmpc, dwpc);
+-    cape::cape(cape_prof, &lpl, Some(pbot), Some(ptop)).bplus
++    let _ = cape_prof; // retained in the signature for the other parcel paths
++    crate::extras::cape_bounded_sharppy(
++        inner,
++        lpl.pres,
++        lpl.tmpc,
++        lpl.dwpc,
++        pbot,
++        ptop,
++    )
++    .0
+ }
+ 
+ /// Port of SHARPpy `params.convective_temp` (mincinh = 0): iteratively warm
+ /// the surface until the lifted parcel's CIN vanishes.
+-fn convective_temp(cape_prof: &cape::Profile, inner: &sharprs::Profile) -> f64 {
++fn convective_temp(_cape_prof: &cape::Profile, inner: &sharprs::Profile) -> f64 {
+     let mincinh = 0.0;
+-    let mmr = match indices::mean_mixratio(inner, None, None) {
++    let surface_pressure = inner.sfc_pressure();
++    let mmr = match crate::extras::sharppy_mean_mixratio(
++        inner,
++        surface_pressure,
++        surface_pressure - 100.0,
++    ) {
+         Some(v) if v.is_finite() => v,
+         _ => return f64::NAN,
+     };
+-    let pres = inner.sfc_pressure();
++    let pres = surface_pressure;
+     let mut tmpc = inner.tmpc[inner.sfc];
+     let dwpc = thermo::temp_at_mixrat(mmr, pres);
+     if !qc(pres) || !qc(tmpc) || !dwpc.is_finite() {
+         return f64::NAN;
+     }
+     let lift = |t: f64| -> (f64, f64) {
+-        let pcl = cape::cape(cape_prof, &user_lpl(pres, t, dwpc), None, None);
+-        (pcl.bplus, pcl.bminus)
++        crate::extras::cape_truncated_sharppy(inner, pres, t, dwpc)
+     };
+     // Quick viability check: if 25 C of heating cannot remove the cap, bail.
+     let (bp, bm) = lift(tmpc + 25.0);
+@@ -854,7 +921,13 @@ fn max_thetae_vertical_velocity(inner: &sharprs::Profile) -> f64 {
+     let omeg: Vec<f64> = inner
+         .omeg
+         .iter()
+-        .map(|&o| if o.is_finite() && o > -9000.0 { o } else { f64::NAN })
++        .map(|&o| {
++            if o.is_finite() && o > -9000.0 {
++                o
++            } else {
++                f64::NAN
++            }
++        })
+         .collect();
+     if omeg.iter().all(|o| o.is_nan()) {
+         return f64::NAN;
+@@ -915,9 +988,8 @@ fn ec_spec_hum(p_pa: f64, td_c: f64) -> f64 {
+ fn ec_r_sat(t_k: f64, p_pa: f64) -> f64 {
+     let term1 = (EC_CPV - EC_CPL) / EC_RV;
+     let term2 = (EC_LV - EC_TTRIP * (EC_CPV - EC_CPL)) / EC_RV;
+-    let esl = ((t_k - EC_TTRIP) * term2 / (t_k * EC_TTRIP)).exp()
+-        * EC_VPR
+-        * (t_k / EC_TTRIP).powf(term1);
++    let esl =
++        ((t_k - EC_TTRIP) * term2 / (t_k * EC_TTRIP)).exp() * EC_VPR * (t_k / EC_TTRIP).powf(term1);
+     EC_PHI * esl / (p_pa - esl).max(1e-9)
+ }
+ 
+@@ -989,7 +1061,10 @@ fn ec_wavg(pres: &[f64], hagl: &[f64], vals: &[f64], bottom: f64, depth: f64) ->
+     if layer.len() < 2 {
+         return vals[0];
+     }
+-    let lv: Vec<f64> = layer.iter().map(|&p| ec_interp_logp(p, pres, vals)).collect();
++    let lv: Vec<f64> = layer
++        .iter()
++        .map(|&p| ec_interp_logp(p, pres, vals))
++        .collect();
+     let mut num = 0.0;
+     let mut den = 0.0;
+     for i in 1..layer.len() {
+@@ -1307,8 +1382,8 @@ fn inferred_temp_adv(inner: &sharprs::Profile) -> (Vec<f64>, Vec<(f64, f64)>) {
+             top_wdir -= 360.0;
+         }
+         let d_theta = top_wdir - 180.0;
+-        let t_adv = multiplier * mean_wspd.powi(2) * avg_temp
+-            * (d_theta / (heights[i] - heights[i - 1]));
++        let t_adv =
++            multiplier * mean_wspd.powi(2) * avg_temp * (d_theta / (heights[i] - heights[i - 1]));
+         temp_adv.push(t_adv * 3600.0);
+     }
+     (temp_adv, bounds)
+diff --git a/src/extras.rs b/src/extras.rs
+index f40a8f01624c5380cd01209e5db48f7a77403b55..c05b4f329f043e499a61fcfe93b6c1fa328ff9aa 100644
+--- a/src/extras.rs
++++ b/src/extras.rs
+@@ -1,13 +1,750 @@
+ //! Small numerics the display needs that `sharprs` does not (yet) provide.
+ 
++use sharprs::Profile;
+ use sharprs::params::cape::{self, LiftedParcelLevel, ParcelResult, ParcelType};
+ use sharprs::params::indices;
+ use sharprs::thermo;
+ use sharprs::winds;
+-use sharprs::Profile;
+ 
+ use crate::utils::qc;
+ 
++/// Replace sharprs' eager Bolton/approximate profile arrays with the
++/// formulations used by SHARPpy's `BasicProfile`.
++///
++/// A single normalization point is important: downstream indices borrow
++/// these cached arrays, so correcting only the values exported through the
++/// Python bridge leaves calculations such as wet-bulb-zero and lapse rates
++/// on a different thermodynamic basis. The raw observations are unchanged.
++pub fn normalize_sharppy_thermodynamics(profile: &mut Profile) {
++    let n = profile.pres.len();
++    profile.vtmp = Vec::with_capacity(n);
++    profile.theta = Vec::with_capacity(n);
++    profile.thetae = Vec::with_capacity(n);
++    profile.wvmr = Vec::with_capacity(n);
++    profile.relh = Vec::with_capacity(n);
++    profile.wetbulb = Vec::with_capacity(n);
++
++    for i in 0..n {
++        let p = profile.pres[i];
++        let t = profile.tmpc[i];
++        let td = profile.dwpc[i];
++        let have_pt = p.is_finite() && p > 0.0 && t.is_finite();
++        let have_td = have_pt && td.is_finite();
++
++        // SHARPpy's virtemp deliberately falls back to the dry temperature
++        // when the dewpoint is masked.
++        profile.vtmp.push(if have_pt {
++            thermo::virtemp(p, t, have_td.then_some(td))
++        } else {
++            f64::NAN
++        });
++        profile.theta.push(if have_pt {
++            thermo::theta(p, t, 1000.0) + 273.15
++        } else {
++            f64::NAN
++        });
++        profile.thetae.push(if have_td {
++            thermo::thetae(p, t, td) + 273.15
++        } else {
++            f64::NAN
++        });
++        profile.wvmr.push(if have_td {
++            thermo::mixratio(p, td)
++        } else {
++            f64::NAN
++        });
++        profile.relh.push(if have_td {
++            thermo::relh(p, t, td)
++        } else {
++            f64::NAN
++        });
++        profile.wetbulb.push(if have_td {
++            thermo::wetbulb(p, t, td)
++        } else {
++            f64::NAN
++        });
++    }
++}
++
++/// Build the parcel solver's lean profile while retaining SHARPpy's virtual-
++/// temperature fallback at levels with temperature but no reported dewpoint.
++/// Candidate parcel moisture remains missing; only the environment virtual
++/// temperature used during ascent is repaired.
++pub fn cape_profile(inner: &Profile) -> cape::Profile {
++    let mut profile = cape::Profile::new(
++        inner.pres.clone(),
++        inner.hght.clone(),
++        inner.tmpc.clone(),
++        inner.dwpc.clone(),
++        inner.sfc,
++    );
++    // The lean CAPE profile already uses SHARPpy's Wobus theta-e/wet-bulb
++    // functions. Copy the centrally normalized arrays so it also inherits
++    // SHARPpy's dry-temperature virtual-temperature fallback.
++    profile.vtmp.clone_from(&inner.vtmp);
++    profile.thetae = inner.thetae.iter().map(|value| value - 273.15).collect();
++    profile.wetbulb.clone_from(&inner.wetbulb);
++    profile
++}
++
++/// Whether every reported wind vector is the same finite vector.
++///
++/// Parcel Bunkers motion is mathematically undefined when the layer shear is
++/// exactly zero.  Legacy NumPy subsequently reduces its all-NaN helicity
++/// layers to zero; callers use this predicate to preserve that narrow public
++/// behavior without turning genuinely missing wind profiles into zeros.
++pub fn has_constant_wind(profile: &Profile) -> bool {
++    let mut reference: Option<(f64, f64)> = None;
++    let mut count = 0usize;
++    for (&u, &v) in profile.u.iter().zip(&profile.v) {
++        if !u.is_finite() || !v.is_finite() {
++            continue;
++        }
++        count += 1;
++        if let Some((u0, v0)) = reference {
++            if (u - u0).abs() > 1.0e-9 || (v - v0).abs() > 1.0e-9 {
++                return false;
++            }
++        } else {
++            reference = Some((u, v));
++        }
++    }
++    count >= 2
++}
++
++/// The literal one-hPa pressure sequence produced by SHARPpy's
++/// ``np.arange(pbot, ptop - 1, -1)`` fast mean routines.
++///
++/// Fractional effective-layer bounds make the final sample extend slightly
++/// above the requested layer top.  Clamping that last point to ``ptop`` looks
++/// cleaner, but changes the effective-parcel moisture enough to move its
++/// LFC/EL and CAP metadata, so preserve NumPy's historical sequence exactly.
++fn sharppy_fast_pressure_grid(pbot: f64, ptop: f64) -> Option<Vec<f64>> {
++    if !pbot.is_finite() || !ptop.is_finite() || pbot < ptop {
++        return None;
++    }
++    let stop = ptop - 1.0;
++    let mut values = Vec::with_capacity((pbot - ptop).ceil() as usize + 1);
++    let mut pressure = pbot;
++    while pressure > stop && values.len() < 2_000 {
++        values.push(pressure);
++        pressure -= 1.0;
++    }
++    (!values.is_empty()).then_some(values)
++}
++
++/// SHARPpy's default (``exact=False``) mean mixing ratio.
++pub fn sharppy_mean_mixratio(prof: &Profile, pbot: f64, ptop: f64) -> Option<f64> {
++    if !prof.interp_tmpc(pbot).is_finite() || !prof.interp_tmpc(ptop).is_finite() {
++        return None;
++    }
++    let mut total = 0.0;
++    let mut count = 0usize;
++    for pressure in sharppy_fast_pressure_grid(pbot, ptop)? {
++        let dewpoint = prof.interp_dwpc(pressure);
++        let mixing_ratio = thermo::mixratio(pressure, dewpoint);
++        if mixing_ratio.is_finite() {
++            total += mixing_ratio;
++            count += 1;
++        }
++    }
++    (count > 0).then_some(total / count as f64)
++}
++
++/// SHARPpy's default pressure-weighted mean potential temperature.
++pub fn sharppy_mean_theta(prof: &Profile, pbot: f64, ptop: f64) -> Option<f64> {
++    if !prof.interp_tmpc(pbot).is_finite() || !prof.interp_tmpc(ptop).is_finite() {
++        return None;
++    }
++    let mut weighted = 0.0;
++    let mut weights = 0.0;
++    for pressure in sharppy_fast_pressure_grid(pbot, ptop)? {
++        let temperature = prof.interp_tmpc(pressure);
++        let theta = thermo::theta(pressure, temperature, 1000.0);
++        if theta.is_finite() {
++            weighted += theta * pressure;
++            weights += pressure;
++        }
++    }
++    (weights > 0.0).then_some(weighted / weights)
++}
++
++/// SHARPpy's stripped `cape(..., trunc=True)` CAPE/CIN calculation.
++///
++/// `convective_temp` intentionally stops the observed-level ascent at 500
++/// hPa, then closes the calculation with one interpolated layer from that
++/// level to the sounding top.  A full `parcelx` result is not equivalent:
++/// elevated and sparse soundings can retain CIN for several extra observed
++/// layers and therefore require too much surface heating.  Keep this helper
++/// narrow (surface parcel, full sounding, one-hPa sub-LCL integration) so the
++/// historical SHARPpy search semantics are explicit and inexpensive.
++pub fn cape_truncated_sharppy(
++    prof: &Profile,
++    pres: f64,
++    tmpc: f64,
++    dwpc: f64,
++) -> (f64, f64) {
++    cape_sharppy_impl(
++        prof,
++        pres,
++        tmpc,
++        dwpc,
++        prof.sfc_pressure(),
++        prof.pres[prof.top],
++        true,
++    )
++}
++
++/// SHARPpy's stripped `cape()` over an explicit pressure layer.
++///
++/// The local HGZ/0-3/0-6 km diagnostics use this exact bounded integral. A
++/// full `parcelx` computes different bookkeeping at an interpolated upper
++/// boundary, while sharprs' current lightweight helper can return missing on
++/// sparse upper-moisture profiles. This port preserves the reference result
++/// without constructing a Python profile.
++pub fn cape_bounded_sharppy(
++    prof: &Profile,
++    pres: f64,
++    tmpc: f64,
++    dwpc: f64,
++    pbot: f64,
++    ptop: f64,
++) -> (f64, f64) {
++    cape_sharppy_impl(prof, pres, tmpc, dwpc, pbot, ptop, false)
++}
++
++fn cape_sharppy_impl(
++    prof: &Profile,
++    pres: f64,
++    tmpc: f64,
++    dwpc: f64,
++    requested_pbot: f64,
++    ptop: f64,
++    truncate_at_500_hpa: bool,
++) -> (f64, f64) {
++    const G: f64 = 9.80665;
++    let missing = (f64::NAN, f64::NAN);
++    if prof.pres.len() < 2
++        || ![pres, tmpc, dwpc, requested_pbot, ptop]
++            .iter()
++            .all(|v| v.is_finite())
++    {
++        return missing;
++    }
++
++    let mut pbot = requested_pbot.min(pres);
++    let interp_vtmp = |p: f64| prof.interp_by_pressure(&prof.vtmp, p);
++    if !interp_vtmp(pbot).is_finite() || !interp_vtmp(ptop).is_finite() {
++        return missing;
++    }
++
++    let (lcl_pres, lcl_temp) = thermo::drylift(pres, tmpc, dwpc);
++    if !lcl_pres.is_finite() || !lcl_temp.is_finite() {
++        return missing;
++    }
++    let theta_parcel = thermo::theta(lcl_pres, lcl_temp, 1000.0);
++    let parcel_mixratio = thermo::mixratio(pres, dwpc);
++    let mut positive = 0.0;
++    let mut negative = 0.0;
++
++    // Literal `np.arange(pbot, lcl_pres - 1, -1)` sampling used by Python.
++    let stop = lcl_pres - 1.0;
++    let mut pressure = pbot;
++    let mut previous: Option<(f64, f64)> = None;
++    let mut samples = 0usize;
++    while pressure > stop && samples < 2_000 {
++        let height = prof.interp_hght(pressure);
++        let env_theta = thermo::theta(pressure, prof.interp_tmpc(pressure), 1000.0);
++        let env_dewpoint = prof.interp_dwpc(pressure);
++        let env_vtmp = thermo::virtemp(
++            pressure,
++            env_theta,
++            env_dewpoint.is_finite().then_some(env_dewpoint),
++        );
++        let parcel_vtmp = thermo::virtemp(
++            pressure,
++            theta_parcel,
++            Some(thermo::temp_at_mixrat(parcel_mixratio, pressure)),
++        );
++        let deficit = (parcel_vtmp - env_vtmp) / thermo::ctok(env_vtmp);
++        if let Some((previous_deficit, previous_height)) = previous {
++            if [deficit, height, previous_deficit, previous_height]
++                .iter()
++                .all(|v| v.is_finite())
++            {
++                let energy = G
++                    * (previous_deficit + deficit)
++                    / 2.0
++                    * (height - previous_height);
++                if energy < 0.0 {
++                    negative += energy;
++                }
++            }
++        }
++        previous = Some((deficit, height));
++        pressure -= 1.0;
++        samples += 1;
++    }
++
++    if pbot > lcl_pres {
++        pbot = lcl_pres;
++    }
++    if pbot < ptop {
++        return missing;
++    }
++    let Some(first) = prof.pres.iter().position(|level| pbot > *level) else {
++        return missing;
++    };
++    let upper_index = prof
++        .pres
++        .iter()
++        .rposition(|level| ptop < *level)
++        .unwrap_or(prof.top);
++
++    let mut pe1 = pbot;
++    let mut h1 = prof.interp_hght(pe1);
++    let mut te1 = interp_vtmp(pe1);
++    let mut tp1 = lcl_temp;
++    for index in first..prof.pres.len() {
++        if !prof.tmpc[index].is_finite() {
++            continue;
++        }
++        let pe2 = prof.pres[index];
++        let h2 = prof.hght[index];
++        let te2 = prof.vtmp[index];
++        let tp2 = thermo::wetlift(pe1, tp1, pe2);
++        let tdef1 = (thermo::virtemp(pe1, tp1, Some(tp1)) - te1) / thermo::ctok(te1);
++        let tdef2 = (thermo::virtemp(pe2, tp2, Some(tp2)) - te2) / thermo::ctok(te2);
++        let layer = G * (tdef1 + tdef2) / 2.0 * (h2 - h1);
++        if !layer.is_finite() {
++            continue;
++        }
++        if layer > 0.0 {
++            positive += layer;
++        } else if pe2 > 500.0 {
++            negative += layer;
++        }
++
++        pe1 = pe2;
++        h1 = h2;
++        te1 = te2;
++        tp1 = tp2;
++
++        if (truncate_at_500_hpa && pe2 <= 500.0) || index >= upper_index {
++            // SHARPpy first removes/re-adds the terminating observed layer,
++            // then integrates directly from that observation to `ptop`.
++            let mut bplus;
++            let mut bminus;
++            if layer > 0.0 {
++                bplus = positive - layer;
++                bminus = negative;
++            } else {
++                bplus = positive;
++                bminus = if pe2 > 500.0 {
++                    negative + layer
++                } else {
++                    negative
++                };
++            }
++
++            let final_height = prof.interp_hght(ptop);
++            let final_env_vtmp = interp_vtmp(ptop);
++            let final_parcel_temp = thermo::wetlift(pe1, tp1, ptop);
++            let start_deficit =
++                (thermo::virtemp(pe1, tp1, Some(tp1)) - te1) / thermo::ctok(te1);
++            let final_deficit = (thermo::virtemp(
++                ptop,
++                final_parcel_temp,
++                Some(final_parcel_temp),
++            ) - final_env_vtmp)
++                / thermo::ctok(final_env_vtmp);
++            let final_layer = G
++                * (start_deficit + final_deficit)
++                / 2.0
++                * (final_height - h1);
++            if final_layer.is_finite() {
++                if final_layer > 0.0 {
++                    bplus += final_layer;
++                } else if ptop > 500.0 {
++                    bminus += final_layer;
++                }
++            }
++            if bplus == 0.0 {
++                bminus = 0.0;
++            }
++            return (bplus, bminus);
++        }
++    }
++    missing
++}
++
++fn interp_log_pressure(p: f64, pres: &[f64], field: &[f64]) -> f64 {
++    if !p.is_finite() || p <= 0.0 || pres.len() != field.len() {
++        return f64::NAN;
++    }
++    let mut lower: Option<(f64, f64)> = None;
++    let mut upper: Option<(f64, f64)> = None;
++    for (&level_p, &value) in pres.iter().zip(field) {
++        if !level_p.is_finite() || level_p <= 0.0 || !value.is_finite() {
++            continue;
++        }
++        if (level_p - p).abs() < 1.0e-9 {
++            return value;
++        }
++        if level_p > p && lower.is_none_or(|(old, _)| level_p < old) {
++            lower = Some((level_p, value));
++        }
++        if level_p < p && upper.is_none_or(|(old, _)| level_p > old) {
++            upper = Some((level_p, value));
++        }
++    }
++    let (p0, v0) = lower.unwrap_or((f64::NAN, f64::NAN));
++    let (p1, v1) = upper.unwrap_or((f64::NAN, f64::NAN));
++    if ![p0, v0, p1, v1].iter().all(|value| value.is_finite()) {
++        return f64::NAN;
++    }
++    let fraction = (p.ln() - p0.ln()) / (p1.ln() - p0.ln());
++    v0 + (v1 - v0) * fraction
++}
++
++/// SHARPpy's pressure-weighted, interpolated mean theta-e.
++///
++/// This is deliberately separate from sharprs' DCAPE helper.  The reference
++/// routine interpolates the profile's cached Wobus theta-e field on a 1-hPa
++/// grid and weights each sample by pressure.  Recomputing theta-e at every
++/// sample and taking an arithmetic mean can select a different downdraft
++/// source layer on sparse or strongly perturbed soundings.
++fn sharppy_mean_thetae(prof: &cape::Profile, mut pbot: f64, ptop: f64) -> Option<f64> {
++    if !interp_log_pressure(pbot, &prof.pres, &prof.tmpc).is_finite() {
++        pbot = prof.pres[prof.sfc];
++    }
++    if !interp_log_pressure(ptop, &prof.pres, &prof.tmpc).is_finite() {
++        return None;
++    }
++
++    let mut weighted = 0.0;
++    let mut weights = 0.0;
++    for pressure in sharppy_fast_pressure_grid(pbot, ptop)? {
++        let thetae = interp_log_pressure(pressure, &prof.pres, &prof.thetae);
++        if thetae.is_finite() {
++            weighted += thetae * pressure;
++            weights += pressure;
++        }
++    }
++    (weights > 0.0).then_some(weighted / weights)
++}
++
++/// Literal SHARPpy downdraft-CAPE source selection, integration, and trace.
++///
++/// sharprs exposes the same diagnostic, but its current implementation uses
++/// an unweighted recomputed-theta-e mean and skips the reported level at the
++/// top of the descent.  Both differences are normally tiny; together they
++/// can move the chosen 100-hPa source layer by hundreds of hPa in sparse
++/// upper-moisture profiles.  Keep this compatibility routine here until that
++/// upstream implementation adopts the reference semantics.
++pub fn sharppy_dcape(prof: &cape::Profile) -> cape::DcapeResult {
++    const G: f64 = 9.80665;
++    let sfc_pres = prof.pres[prof.sfc];
++    let valid: Vec<usize> = (0..prof.pres.len())
++        .filter(|&index| prof.pres[index].is_finite() && prof.thetae[index].is_finite())
++        .collect();
++
++    let mut minimum = 1000.0;
++    let mut source_pressure = f64::NAN;
++    for &index in &valid {
++        let pressure = prof.pres[index];
++        if pressure < sfc_pres - 400.0 {
++            continue;
++        }
++        let Some(mean) = sharppy_mean_thetae(prof, pressure, pressure - 100.0) else {
++            continue;
++        };
++        if mean < minimum {
++            minimum = mean;
++            source_pressure = pressure - 50.0;
++        }
++    }
++
++    if !source_pressure.is_finite() {
++        return cape::DcapeResult {
++            dcape: 0.0,
++            ttrace: Vec::new(),
++            ptrace: Vec::new(),
++        };
++    }
++    let Some(source_position) = valid
++        .iter()
++        .rposition(|&index| prof.pres[index] >= source_pressure)
++    else {
++        return cape::DcapeResult {
++            dcape: 0.0,
++            ttrace: Vec::new(),
++            ptrace: Vec::new(),
++        };
++    };
++    let source_temp = interp_log_pressure(source_pressure, &prof.pres, &prof.tmpc);
++    let source_dewpoint = interp_log_pressure(source_pressure, &prof.pres, &prof.dwpc);
++    let source_wetbulb = thermo::wetbulb(source_pressure, source_temp, source_dewpoint);
++    let mut pe1 = source_pressure;
++    let mut te1 = source_temp;
++    let mut h1 = interp_log_pressure(source_pressure, &prof.pres, &prof.hght);
++    let mut tp1 = source_wetbulb;
++    let mut total = 0.0;
++    let mut descending_ttrace = Vec::with_capacity(source_position + 1);
++    let mut descending_ptrace = Vec::with_capacity(source_position + 1);
++
++    // SHARPpy walks the filtered reported levels from the source down through
++    // the surface, including both endpoints.
++    for position in (0..=source_position).rev() {
++        let index = valid[position];
++        let pe2 = prof.pres[index];
++        let te2 = prof.tmpc[index];
++        let h2 = prof.hght[index];
++        let tp2 = thermo::wetlift(pe1, tp1, pe2);
++        if te1.is_finite() && te2.is_finite() {
++            let tdef1 = (tp1 - te1) / (te1 + 273.15);
++            let tdef2 = (tp2 - te2) / (te2 + 273.15);
++            total += G * (tdef1 + tdef2) / 2.0 * (h2 - h1);
++        }
++        descending_ttrace.push(tp2);
++        descending_ptrace.push(pe2);
++        pe1 = pe2;
++        te1 = te2;
++        h1 = h2;
++        tp1 = tp2;
++    }
++
++    // The historical object starts with the interpolated source point, then
++    // appends the reported levels in descent order through the surface.
++    let mut ttrace = Vec::with_capacity(descending_ttrace.len() + 1);
++    let mut ptrace = Vec::with_capacity(descending_ptrace.len() + 1);
++    ttrace.push(source_wetbulb);
++    ptrace.push(source_pressure);
++    ttrace.extend(descending_ttrace);
++    ptrace.extend(descending_ptrace);
++
++    cape::DcapeResult {
++        dcape: total,
++        ttrace,
++        ptrace,
++    }
++}
++
++/// SHARPpy parcel metadata that sharprs' otherwise-equivalent lift does not
++/// reproduce literally.
++///
++/// In particular, SHARPpy's 1-hPa maximum-parcel-level loop never updates
++/// its `h3` base height. That historical quirk materially changes MPL
++/// pressure, and later LFC/EL crossings clear MPL pressure without clearing a
++/// height already found. Release parity requires preserving both quirks. The
++/// same pass records CAP/CAPPRES only on the LFC search branch, exactly as the
++/// Python routine does. It intentionally does not replace CAPE/CIN or the
++/// parcel trace.
++fn sharppy_parcel_metadata(prof: &cape::Profile, lpl: &LiftedParcelLevel) -> (f64, f64, f64, f64) {
++    const G: f64 = 9.80665;
++    let mut cap = f64::NAN;
++    let mut cappres = f64::NAN;
++    let mut mplpres = f64::NAN;
++    let mut mplhght = f64::NAN;
++
++    if ![lpl.pres, lpl.tmpc, lpl.dwpc]
++        .iter()
++        .all(|value| value.is_finite())
++    {
++        return (cap, cappres, mplpres, mplhght);
++    }
++
++    let (lcl_pres, lcl_temp) = thermo::drylift(lpl.pres, lpl.tmpc, lpl.dwpc);
++    if !lcl_pres.is_finite() || !lcl_temp.is_finite() {
++        return (cap, cappres, mplpres, mplhght);
++    }
++    let mut pbot = prof.pres[prof.sfc].min(lpl.pres);
++    if pbot > lcl_pres {
++        pbot = lcl_pres;
++    }
++    let Some(lptr) = (prof.sfc..prof.pres.len()).find(|&i| pbot >= prof.pres[i]) else {
++        return (cap, cappres, mplpres, mplhght);
++    };
++
++    let interp_hght = |p| interp_log_pressure(p, &prof.pres, &prof.hght);
++    let interp_vtmp = |p| interp_log_pressure(p, &prof.pres, &prof.vtmp);
++    let mut pe1 = pbot;
++    let mut h1 = interp_hght(pe1);
++    let mut te1 = interp_vtmp(pe1);
++    let mut tp1 = thermo::wetlift(lcl_pres, lcl_temp, pe1);
++    if ![h1, te1, tp1].iter().all(|value| value.is_finite()) {
++        return (cap, cappres, mplpres, mplhght);
++    }
++
++    let mut lyre = 0.0;
++    let mut tote = 0.0;
++    let mut cap_strength = -9999.0_f64;
++    let mut cap_strengthpres = -9999.0_f64;
++    let mut elpres = f64::NAN;
++
++    for i in lptr..prof.pres.len() {
++        if !prof.tmpc[i].is_finite() {
++            continue;
++        }
++        let pe2 = prof.pres[i];
++        let h2 = prof.hght[i];
++        let te2 = prof.vtmp[i];
++        let tp2 = thermo::wetlift(pe1, tp1, pe2);
++        if ![pe2, h2, te2, tp2].iter().all(|value| value.is_finite()) {
++            continue;
++        }
++        let tdef1 = (thermo::virtemp(pe1, tp1, Some(tp1)) - te1) / (te1 + 273.15);
++        let tdef2 = (thermo::virtemp(pe2, tp2, Some(tp2)) - te2) / (te2 + 273.15);
++        let lyrlast = lyre;
++        lyre = G * (tdef1 + tdef2) / 2.0 * (h2 - h1);
++        if !lyre.is_finite() {
++            continue;
++        }
++
++        let mli = thermo::virtemp(pe2, tp2, Some(tp2)) - te2;
++        // Preserve the literal SHARPpy parcelx CAP diagnostic.  Although
++        // ``-mli`` looks like the natural inversion strength, the reference
++        // routine records ``te2 - mli`` and existing public CAP/CAPPRES values
++        // depend on that historical expression.
++        let mcap = te2 - mli;
++        if mcap > cap_strength {
++            cap_strength = mcap;
++            cap_strengthpres = pe2;
++        }
++        tote += lyre;
++
++        let pelast = pe1;
++        pe1 = pe2;
++        h1 = h2;
++        te1 = te2;
++        tp1 = tp2;
++
++        // LFC possibility. The direct-crossing branch deliberately does not
++        // save CAP/CAPPRES or reset `tote`; this is SHARPpy's behavior.
++        if lyre >= 0.0 && lyrlast <= 0.0 {
++            let parcel_at_previous = thermo::wetlift(pe1, tp1, pelast);
++            if interp_vtmp(pelast)
++                < thermo::virtemp(pelast, parcel_at_previous, Some(parcel_at_previous))
++            {
++                elpres = f64::NAN;
++                mplpres = f64::NAN;
++            } else {
++                let mut crossing = pelast;
++                let mut found = false;
++                for _ in 0..400 {
++                    if crossing <= 0.0 {
++                        break;
++                    }
++                    let parcel = thermo::wetlift(pe1, tp1, crossing);
++                    let env = interp_vtmp(crossing);
++                    if !parcel.is_finite() || !env.is_finite() {
++                        break;
++                    }
++                    if env <= thermo::virtemp(crossing, parcel, Some(parcel)) {
++                        found = true;
++                        break;
++                    }
++                    crossing -= 5.0;
++                }
++                if found && crossing > 0.0 {
++                    tote = 0.0;
++                    if cap_strength < 0.0 {
++                        cap_strength = 0.0;
++                    }
++                    cap = cap_strength;
++                    cappres = cap_strengthpres;
++                    elpres = f64::NAN;
++                    mplpres = f64::NAN;
++                }
++            }
++        }
++
++        // EL possibility.
++        if lyre <= 0.0 && lyrlast >= 0.0 {
++            let mut crossing = pelast;
++            for _ in 0..400 {
++                if crossing <= 0.0 {
++                    break;
++                }
++                let parcel = thermo::wetlift(pe1, tp1, crossing);
++                let env = interp_vtmp(crossing);
++                if !parcel.is_finite() || !env.is_finite() {
++                    crossing = f64::NAN;
++                    break;
++                }
++                if env >= thermo::virtemp(crossing, parcel, Some(parcel)) {
++                    break;
++                }
++                crossing -= 5.0;
++            }
++            elpres = crossing;
++            mplpres = f64::NAN;
++        }
++
++        // MPL possibility, including the reference routine's intentionally
++        // non-updated `h3` inside the 1-hPa loop.
++        if tote < 0.0 && !mplpres.is_finite() && elpres.is_finite() {
++            let mut pe3 = pelast;
++            let h3 = interp_hght(pe3);
++            let mut te3 = interp_vtmp(pe3);
++            let mut tp3 = thermo::wetlift(pe1, tp1, pe3);
++            let mut totx = tote - lyre;
++            let mut pe2m = pelast;
++            let mut valid = [h3, te3, tp3, totx].iter().all(|value| value.is_finite());
++            for _ in 0..2000 {
++                if !valid || totx <= 0.0 || pe2m <= 0.0 {
++                    break;
++                }
++                pe2m -= 1.0;
++                let te2m = interp_vtmp(pe2m);
++                let tp2m = thermo::wetlift(pe3, tp3, pe2m);
++                let h2m = interp_hght(pe2m);
++                valid = [te2m, tp2m, h2m].iter().all(|value| value.is_finite());
++                if !valid {
++                    break;
++                }
++                let td3 = (thermo::virtemp(pe3, tp3, Some(tp3)) - te3) / (te3 + 273.15);
++                let td2 = (thermo::virtemp(pe2m, tp2m, Some(tp2m)) - te2m) / (te2m + 273.15);
++                // Do not update h3 here: that is the legacy SHARPpy quirk.
++                let lyrf = G * (td3 + td2) / 2.0 * (h2m - h3);
++                if !lyrf.is_finite() {
++                    valid = false;
++                    break;
++                }
++                totx += lyrf;
++                tp3 = tp2m;
++                te3 = te2m;
++                pe3 = pe2m;
++            }
++            let height = interp_hght(pe2m);
++            if valid && totx <= 0.0 && pe2m.is_finite() && height.is_finite() {
++                mplpres = pe2m;
++                mplhght = height - prof.hght[prof.sfc];
++            }
++        }
++    }
++
++    (cap, cappres, mplpres, mplhght)
++}
++
++/// Full SHARPpy parcel lift with literal legacy CAP/MPL metadata semantics.
++pub fn parcelx_sharppy(
++    prof: &cape::Profile,
++    lpl: &LiftedParcelLevel,
++    pbot: Option<f64>,
++    ptop: Option<f64>,
++) -> ParcelResult {
++    let mut parcel = cape::parcelx(prof, lpl, pbot, ptop);
++    if pbot.is_none() && ptop.is_none() {
++        let (cap, cappres, mplpres, mplhght) = sharppy_parcel_metadata(prof, lpl);
++        parcel.cap = cap;
++        parcel.cappres = cappres;
++        parcel.mplpres = mplpres;
++        parcel.mplhght = mplhght;
++    }
++    parcel
++}
++
+ /// SHARPpy-style forecast surface parcel: forecast max temperature (100-hPa
+ /// mixed layer warmed 2 K) with the mean boundary-layer mixing ratio.
+ /// sharprs's own `ParcelType::Forecast` uses the current surface temperature
+@@ -15,15 +752,19 @@ use crate::utils::qc;
+ pub fn forecast_parcel(inner: &Profile, cape_prof: &cape::Profile) -> ParcelResult {
+     let pres = inner.pres[inner.sfc];
+     let tmpc = indices::max_temp(inner, Some(100.0)).unwrap_or(f64::NAN);
+-    let mmr = indices::mean_mixratio(inner, Some(pres), Some(pres - 100.0)).unwrap_or(f64::NAN);
+-    let dwpc = thermo::temp_at_mixrat(mmr, pres);
++    // SHARPpy's forecast parcel uses `mean_mixratio(..., exact=True)`, the
++    // same exact observed-level average used by its 100-hPa mixed-layer
++    // parcel.  Reuse sharprs' exact mixed-layer definition for the moisture
++    // source instead of the 1-hPa fast mean in `indices::mean_mixratio`.
++    let mixed = cape::define_parcel(cape_prof, ParcelType::MixedLayer { depth_hpa: 100.0 });
++    let dwpc = mixed.dwpc;
+     let lpl = LiftedParcelLevel {
+         pres,
+         tmpc,
+         dwpc,
+         parcel_type: ParcelType::UserDefined { pres, tmpc, dwpc },
+     };
+-    cape::parcelx(cape_prof, &lpl, None, None)
++    parcelx_sharppy(cape_prof, &lpl, None, None)
+ }
+ 
+ /// Parcel-based Bunkers storm motion `(rstu, rstv, lstu, lstv)` in kts —
+@@ -44,16 +785,15 @@ pub fn bunkers_storm_motion(
+         let depth = muel - base;
+         let htop = base + depth * (65.0 / 100.0);
+         let ptop = prof.pres_at_height(prof.to_msl(htop));
+-        let (mnu, mnv) = winds::mean_wind(prof, pbot, ptop, -1.0, 0.0, 0.0)
+-            .unwrap_or((f64::NAN, f64::NAN));
++        let (mnu, mnv) =
++            winds::mean_wind(prof, pbot, ptop, -1.0, 0.0, 0.0).unwrap_or((f64::NAN, f64::NAN));
+         let (sru, srv) = winds::wind_shear(prof, pbot, ptop).unwrap_or((f64::NAN, f64::NAN));
+         let srmag = (sru * sru + srv * srv).sqrt();
+         let uchg = d / srmag * srv;
+         let vchg = d / srmag * sru;
+         (mnu + uchg, mnv - vchg, mnu - uchg, mnv + vchg)
+     } else {
+-        winds::non_parcel_bunkers_motion(prof)
+-            .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN))
++        winds::non_parcel_bunkers_motion(prof).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN))
+     }
+ }
+ 
+@@ -134,11 +874,7 @@ pub fn helicity(prof: &Profile, lower: f64, upper: f64, stu: f64, stv: f64) -> (
+     (phel + nhel, phel, nhel)
+ }
+ 
+-/// Virtual-temperature lapse rate (C/km) over an AGL layer, boundary-clamped
+-/// like [`helicity`]. This is the vendored SHARPpy `params.lapse_rate`
+-/// convention (sharpmod's SFC-500m/SFC-1km rows used plain temperature — a
+-/// quirk deliberately not reproduced; see PORTING.md).
+-pub fn lapse_rate_agl(prof: &Profile, lower_m: f64, upper_m: f64) -> f64 {
++fn lapse_rate_agl_field(prof: &Profile, values: &[f64], lower_m: f64, upper_m: f64) -> f64 {
+     let z1 = prof.to_msl(lower_m);
+     let z2 = prof.to_msl(upper_m);
+     let mut p1 = prof.pres_at_height(z1);
+@@ -151,11 +887,24 @@ pub fn lapse_rate_agl(prof: &Profile, lower_m: f64, upper_m: f64) -> f64 {
+     if !qc(p1) || !qc(p2) {
+         return f64::NAN;
+     }
+-    let tv1 = prof.interp_by_pressure(&prof.vtmp, p1);
+-    let tv2 = prof.interp_by_pressure(&prof.vtmp, p2);
++    let tv1 = prof.interp_by_pressure(values, p1);
++    let tv2 = prof.interp_by_pressure(values, p2);
+     let dz = z2 - z1;
+     if !qc(tv1) || !qc(tv2) || dz.abs() < 1.0 {
+         return f64::NAN;
+     }
+     (tv2 - tv1) / dz * -1000.0
+ }
++
++/// Virtual-temperature lapse rate (C/km) over an AGL layer, boundary-clamped
++/// like [`helicity`]. This is the vendored SHARPpy `params.lapse_rate`
++/// convention used by the 0–3 and 3–6 km diagnostics.
++pub fn lapse_rate_agl(prof: &Profile, lower_m: f64, upper_m: f64) -> f64 {
++    lapse_rate_agl_field(prof, &prof.vtmp, lower_m, upper_m)
++}
++
++/// Plain-temperature lapse rate used by sharpmod's displayed SFC–500 m and
++/// SFC–1 km companion parameters.
++pub fn temperature_lapse_rate_agl(prof: &Profile, lower_m: f64, upper_m: f64) -> f64 {
++    lapse_rate_agl_field(prof, &prof.tmpc, lower_m, upper_m)
++}
+diff --git a/src/profile.rs b/src/profile.rs
+index aaf66d1f6013e23c5dec6998dcc2210d4cd75399..3ecf7626287ae966032d1d00128848346b7853e3 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -3,9 +3,7 @@
+ //! SHARPpy engine. All numerics live in `sharprs`; this struct just computes
+ //! and caches, once, everything the widget draws.
+ 
+-use sharprs::params::cape::{
+-    self, ParcelResult, ParcelType as SharprsParcelType, define_parcel, parcelx,
+-};
++use sharprs::params::cape::{self, ParcelResult, ParcelType as SharprsParcelType, define_parcel};
+ use sharprs::params::indices;
+ use sharprs::profile::StationInfo;
+ use sharprs::winds;
+@@ -133,18 +131,15 @@ impl Profile {
+ 
+     /// Analyze an existing [`sharprs::Profile`] (e.g. one produced by
+     /// `rustwx-sounding`).
+-    pub fn from_sharprs(inner: sharprs::Profile) -> Profile {
++    pub fn from_sharprs(mut inner: sharprs::Profile) -> Profile {
++        // Establish SHARPpy's public thermodynamic contract before any parcel
++        // or derived calculation consumes sharprs' eager cached arrays.
++        extras::normalize_sharppy_thermodynamics(&mut inner);
+         // The parcel routines take sharprs's lean cape::Profile (same bridge
+         // sharprs's own compositor uses).
+-        let cape_prof = cape::Profile::new(
+-            inner.pres.clone(),
+-            inner.hght.clone(),
+-            inner.tmpc.clone(),
+-            inner.dwpc.clone(),
+-            inner.sfc,
+-        );
++        let cape_prof = extras::cape_profile(&inner);
+         let lift = |ptype: SharprsParcelType| {
+-            parcelx(&cape_prof, &define_parcel(&cape_prof, ptype), None, None)
++            extras::parcelx_sharppy(&cape_prof, &define_parcel(&cape_prof, ptype), None, None)
+         };
+         let mupcl = lift(SharprsParcelType::MostUnstable { depth_hpa: 300.0 });
+         let sfcpcl = if mupcl.pres == inner.pres[inner.sfc] {
+@@ -155,8 +150,7 @@ impl Profile {
+         let fcstpcl = extras::forecast_parcel(&inner, &cape_prof);
+         let mlpcl = lift(SharprsParcelType::MixedLayer { depth_hpa: 100.0 });
+ 
+-        let (ebottom, etop) =
+-            cape::effective_inflow_layer(&cape_prof, 100.0, -250.0, Some(&mupcl));
++        let (ebottom, etop) = effective_inflow_layer(&cape_prof, &mupcl);
+         let mut ebotm = f64::NAN;
+         let mut etopm = f64::NAN;
+         let mut right_esrh = f64::NAN;
+@@ -169,8 +163,12 @@ impl Profile {
+                 right_esrh = extras::helicity(&inner, ebotm, etopm, srwind.0, srwind.1).0;
+             }
+         } else {
+-            srwind = winds::non_parcel_bunkers_motion(&inner)
+-                .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
++            srwind = winds::non_parcel_bunkers_motion(&inner).unwrap_or((
++                f64::NAN,
++                f64::NAN,
++                f64::NAN,
++                f64::NAN,
++            ));
+         }
+ 
+         let mlr = indices::max_lapse_rate(
+@@ -180,11 +178,11 @@ impl Profile {
+             Some(250.0),
+             Some(2000.0),
+         );
+-        let max_lapse_rate_2_6 = mlr
+-            .map(|m| (m.value, m.pbot, m.ptop))
+-            .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
++        let max_lapse_rate_2_6 =
++            mlr.map(|m| (m.value, m.pbot, m.ptop))
++                .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+ 
+-        let dc = cape::dcape(&cape_prof);
++        let dc = extras::sharppy_dcape(&cape_prof);
+ 
+         Profile {
+             inner,
+@@ -220,3 +218,82 @@ impl Profile {
+         self.inner.station.latitude
+     }
+ }
++
++/// SHARPpy-compatible effective-inflow search using the fast CAPE/CIN solver.
++///
++/// This mirrors SHARPpy's `effective_inflow_layer`, which intentionally uses
++/// its stripped-down `cape()` routine for each candidate.  `cape_profile()`
++/// has already installed SHARPpy's dry-temperature virtual-temperature
++/// fallback, so sparse BUFKIT upper moisture no longer makes the fast solver
++/// return a false zero.
++fn effective_inflow_layer(prof: &cape::Profile, mupcl: &ParcelResult) -> (f64, f64) {
++    const MIN_CAPE: f64 = 100.0;
++    const MIN_CIN: f64 = -250.0;
++
++    if !mupcl.bplus.is_finite()
++        || mupcl.bplus == 0.0
++        || mupcl.bplus < MIN_CAPE
++        || !mupcl.bminus.is_finite()
++        || mupcl.bminus <= MIN_CIN
++    {
++        return (f64::NAN, f64::NAN);
++    }
++
++    let mut bottom_index = None;
++    for i in prof.sfc..prof.top {
++        if !prof.tmpc[i].is_finite() || !prof.dwpc[i].is_finite() {
++            continue;
++        }
++        let level = cape::LiftedParcelLevel {
++            pres: prof.pres[i],
++            tmpc: prof.tmpc[i],
++            dwpc: prof.dwpc[i],
++            parcel_type: SharprsParcelType::UserDefined {
++                pres: prof.pres[i],
++                tmpc: prof.tmpc[i],
++                dwpc: prof.dwpc[i],
++            },
++        };
++        let parcel = cape::cape(prof, &level, None, None);
++        if parcel.bplus >= MIN_CAPE && parcel.bminus > MIN_CIN {
++            bottom_index = Some(i);
++            break;
++        }
++    }
++
++    let Some(bottom_index) = bottom_index else {
++        return (f64::NAN, f64::NAN);
++    };
++    let pbot = prof.pres[bottom_index];
++
++    for i in (bottom_index + 1)..prof.top {
++        if !prof.tmpc[i].is_finite() || !prof.dwpc[i].is_finite() {
++            continue;
++        }
++        let level = cape::LiftedParcelLevel {
++            pres: prof.pres[i],
++            tmpc: prof.tmpc[i],
++            dwpc: prof.dwpc[i],
++            parcel_type: SharprsParcelType::UserDefined {
++                pres: prof.pres[i],
++                tmpc: prof.tmpc[i],
++                dwpc: prof.dwpc[i],
++            },
++        };
++        let parcel = cape::cape(prof, &level, None, None);
++        if parcel.bplus < MIN_CAPE || parcel.bminus <= MIN_CIN {
++            let mut previous = i - 1;
++            while previous > bottom_index
++                && !prof.tmpc[previous].is_finite()
++                && !prof.dwpc[previous].is_finite()
++            {
++                previous -= 1;
++            }
++            return (pbot, prof.pres[previous].min(pbot));
++        }
++    }
++
++    // This deliberately follows SHARPpy: if no failing level is found before
++    // the profile top, the effective top remains undefined.
++    (pbot, f64::NAN)
++}
+diff --git a/tests/golden_full.rs b/tests/golden_full.rs
+index ab8e3a7e21863213d962dc6838243b742d2c46b9..1455c86ea46b07182652c0b39e4fc9a1c48aebac 100644
+--- a/tests/golden_full.rs
++++ b/tests/golden_full.rs
+@@ -143,14 +143,9 @@ fn lapse_rates() {
+         TOL_STD,
+         "lapserate_700_500",
+     );
+-    // DELIBERATE DEVIATION from the sharpmod goldens: sharpmod's
+-    // SFC-500m/SFC-1km rows use plain temperature; every other row of the
+-    // lapse-rate box (and vendored SHARPpy's params.lapse_rate) uses virtual
+-    // temperature. We use vtmp for all rows. Oracle values below are from
+-    // vendored SHARPpy `params.lapse_rate(prof, 0, 500/1000, pres=False)`
+-    // run on this sounding.
+-    assert_close(d.lapserate_sfc_500m, 4.908568889523174, TOL_STD, "lapserate_sfc_500m (vtmp)");
+-    assert_close(d.lapserate_sfc_1km, 6.384036612547792, TOL_STD, "lapserate_sfc_1km (vtmp)");
++    // The established sharpmod companion rows use plain temperature.
++    assert_close(d.lapserate_sfc_500m, 4.078643453915149, TOL_STD, "lapserate_sfc_500m");
++    assert_close(d.lapserate_sfc_1km, 5.742912574667113, TOL_STD, "lapserate_sfc_1km");
+ }
+ 
+ #[test]
+@@ -209,12 +204,10 @@ fn mean_and_sr_winds() {
+     assert_pair(d.mean_eff, &g["mean_eff"], TOL_STD, "mean_eff");
+     assert_pair(d.mean_ebw, &g["mean_ebw"], TOL_STD, "mean_ebw");
+     assert_pair(d.mean_lcl_el, &g["mean_lcl_el"], TOL_STD, "mean_lcl_el");
+-    assert_pair(
+-        d.srw_sfc_500m,
+-        &g["derived_srw_sfc_500m"],
+-        TOL_STD,
+-        "srw_sfc_500m",
+-    );
++    // Full ConvectiveProfile semantics use the active parcel-based storm
++    // motion; the old lightweight companion golden had no `srwind` field.
++    assert_close(d.srw_sfc_500m.0, -23.012134993750124, TOL_STD, "srw_sfc_500m u");
++    assert_close(d.srw_sfc_500m.1, 16.923505869930047, TOL_STD, "srw_sfc_500m v");
+     assert_pair(d.srw_1km, &g["right_srw_1km"], TOL_STD, "srw_1km");
+     assert_pair(d.srw_3km, &g["right_srw_3km"], TOL_STD, "srw_3km");
+     assert_pair(d.srw_6km, &g["right_srw_6km"], TOL_STD, "srw_6km");
+@@ -252,8 +245,11 @@ fn corfidi_critical_angle_brn() {
+ #[test]
+ fn reimagined_derived_composites() {
+     let (g, _prof, d) = load();
+-    assert_close(d.ehi_0_1km, num(&g["derived_ehi_0_1km"]), TOL_CAPE, "ehi_0_1km");
+-    assert_close(d.ehi_0_3km, num(&g["derived_ehi_0_3km"]), TOL_CAPE, "ehi_0_3km");
++    // The lightweight companion golden has no cached parcel Bunkers vector;
++    // the public full ConvectiveProfile does.  Gate EHI against that
++    // authoritative full-profile oracle.
++    assert_close(d.ehi_0_1km, 4.199107693440347, TOL_CAPE, "ehi_0_1km");
++    assert_close(d.ehi_0_3km, 6.606137999967635, TOL_CAPE, "ehi_0_3km");
+     assert_close(d.vgp, num(&g["derived_vgp"]), TOL_CAPE, "vgp");
+     assert_close(d.peskov, num(&g["derived_peskov"]), TOL_CAPE, "peskov");
+     assert_close(d.mcs_index, num(&g["derived_mcs_index"]), TOL_CAPE, "mcs_index");
+diff --git a/tests/parity_regressions.rs b/tests/parity_regressions.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2305510e1e1fe039707c6b1c576d55b2cd06e7b2
+--- /dev/null
++++ b/tests/parity_regressions.rs
+@@ -0,0 +1,277 @@
++//! Focused release gates for SHARPpy-equivalent edge semantics.
++
++use sharppyrs::sharprs::params::cape::{LiftedParcelLevel, ParcelType};
++use sharppyrs::sharprs::thermo;
++use sharppyrs::{DerivedParams, Profile, SoundingData};
++
++include!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/hrrr_example.rs"));
++
++fn close(actual: f64, expected: f64, tolerance: f64, label: &str) {
++    assert!(
++        (actual - expected).abs() <= tolerance,
++        "{label}: got {actual}, expected {expected} +/- {tolerance}"
++    );
++}
++
++fn bufkit_case(stim: u32) -> SoundingData {
++    let raw = include_str!("../../../examples/soundings/hrrr_kbvo_20260625_06z.buf");
++    let marker = format!("STIM = {stim}");
++    let block = raw
++        .split(&marker)
++        .nth(1)
++        .expect("requested BUFKIT forecast block")
++        .split("\nSTID =")
++        .next()
++        .unwrap();
++    let mut lines = block.lines();
++    while lines.next().is_some_and(|line| line.trim() != "CFRL HGHT") {}
++
++    let mut pres = Vec::new();
++    let mut hght = Vec::new();
++    let mut tmpc = Vec::new();
++    let mut dwpc = Vec::new();
++    let mut wdir = Vec::new();
++    let mut wspd = Vec::new();
++    let mut omeg = Vec::new();
++    loop {
++        let Some(first) = lines.next() else { break };
++        if first.trim().is_empty() {
++            break;
++        }
++        let values: Vec<f64> = first
++            .split_whitespace()
++            .map(|value| value.parse().unwrap())
++            .collect();
++        if values.len() != 8 {
++            break;
++        }
++        let height_line = lines.next().expect("BUFKIT CFRL/HGHT row");
++        let height: Vec<f64> = height_line
++            .split_whitespace()
++            .map(|value| value.parse().unwrap())
++            .collect();
++        pres.push(values[0]);
++        tmpc.push(values[1]);
++        dwpc.push(values[3]);
++        wdir.push(values[5]);
++        wspd.push(values[6]);
++        omeg.push(values[7]);
++        hght.push(height[1]);
++    }
++    assert_eq!(pres.len(), 50);
++    SoundingData {
++        pres,
++        hght,
++        tmpc,
++        dwpc,
++        wdir,
++        wspd,
++        omeg: Some(omeg),
++        latitude: Some(36.76),
++        longitude: Some(-96.01),
++        missing: Some(-9999.0),
++    }
++}
++
++#[test]
++fn hrrr_mpl_and_public_thermodynamics_match_legacy() {
++    let profile = Profile::new(hrrr_example()).unwrap();
++    close(profile.sfcpcl.mplpres, 93.0, 1.0e-9, "SFC MPL pressure");
++    close(profile.mupcl.mplpres, 93.0, 1.0e-9, "MU MPL pressure");
++    close(profile.mlpcl.mplpres, 94.0, 1.0e-9, "ML MPL pressure");
++    close(profile.fcstpcl.mplpres, 74.0, 1.0e-9, "FCST MPL pressure");
++
++    let top = profile.inner.top;
++    close(profile.inner.vtmp[top], -58.01839416565872, 1.0e-9, "vtmp");
++    close(profile.inner.theta[top], 506.318709645886, 1.0e-9, "theta");
++    close(profile.inner.thetae[top], 481.4473886260743, 1.0e-9, "thetae");
++    close(profile.inner.wvmr[top], 0.011613879645246603, 1.0e-12, "wvmr");
++    close(profile.inner.relh[top], 3.823807641140326, 1.0e-9, "relh");
++    close(profile.inner.wetbulb[top], -59.043616414069454, 1.0e-9, "wetbulb");
++}
++
++#[test]
++fn sparse_upper_bufkit_keeps_el_mpl_and_effective_layer() {
++    let profile = Profile::new(bufkit_case(41)).unwrap();
++    close(profile.ebottom, 982.7, 1.0e-9, "effective bottom");
++    close(profile.etop, 807.2, 1.0e-9, "effective top");
++    close(profile.sfcpcl.elpres, 149.1, 1.0e-9, "SFC EL");
++    close(profile.sfcpcl.mplpres, 80.7, 1.0e-9, "SFC MPL");
++    close(profile.mlpcl.elpres, 154.1, 1.0e-9, "ML EL");
++    close(profile.mlpcl.mplpres, 82.7, 1.0e-9, "ML MPL");
++    close(profile.fcstpcl.elpres, 144.1, 1.0e-9, "FCST EL");
++    close(profile.fcstpcl.mplpres, 72.3, 1.0e-9, "FCST MPL");
++
++    let inner = &profile.inner;
++    let mean_theta = sharppyrs::extras::sharppy_mean_theta(
++        inner,
++        profile.ebottom,
++        profile.etop,
++    )
++    .unwrap();
++    let mean_mixratio = sharppyrs::extras::sharppy_mean_mixratio(
++        inner,
++        profile.ebottom,
++        profile.etop,
++    )
++    .unwrap();
++    let pres = (profile.ebottom + profile.etop) / 2.0;
++    let tmpc = thermo::theta(1000.0, mean_theta, pres);
++    let dwpc = thermo::temp_at_mixrat(mean_mixratio, pres);
++    close(dwpc, 19.54875852653862, 1.0e-9, "effective dewpoint");
++    let cape_profile = sharppyrs::extras::cape_profile(inner);
++    let level = LiftedParcelLevel {
++        pres,
++        tmpc,
++        dwpc,
++        parcel_type: ParcelType::UserDefined { pres, tmpc, dwpc },
++    };
++    let effective = sharppyrs::extras::parcelx_sharppy(&cape_profile, &level, None, None);
++    close(effective.elpres, 163.0, 1.0e-9, "effective EL");
++    close(effective.mplpres, 93.6, 1.0e-9, "effective MPL");
++    assert!(effective.mplhght.is_finite());
++    assert!(effective.bplus > 2_100.0, "effective CAPE unexpectedly lost");
++
++    let derived = DerivedParams::compute(&profile);
++    close(derived.conv_t_f, 86.432, 1.0e-9, "convective temperature");
++}
++
++#[test]
++fn single_level_effective_layer_keeps_its_effective_parcel() {
++    // F026 has exactly one qualifying effective-inflow level. NumPy's
++    // arange(pbot, ptop - 1, -1) still emits that one pressure when the bounds
++    // are equal; rejecting a zero-depth grid silently substituted SFC parcel.
++    let profile = Profile::new(bufkit_case(26)).unwrap();
++    close(profile.ebottom, 951.9, 1.0e-9, "effective bottom");
++    close(profile.etop, 951.9, 1.0e-9, "effective top");
++
++    let inner = &profile.inner;
++    let mean_theta = sharppyrs::extras::sharppy_mean_theta(
++        inner,
++        profile.ebottom,
++        profile.etop,
++    )
++    .expect("single-level mean theta");
++    let mean_mixratio = sharppyrs::extras::sharppy_mean_mixratio(
++        inner,
++        profile.ebottom,
++        profile.etop,
++    )
++    .expect("single-level mean mixing ratio");
++    let pres = (profile.ebottom + profile.etop) / 2.0;
++    let tmpc = thermo::theta(1000.0, mean_theta, pres);
++    let dwpc = thermo::temp_at_mixrat(mean_mixratio, pres);
++    close(pres, 951.9, 1.0e-9, "effective pressure");
++    close(tmpc, 21.54, 1.0e-9, "effective temperature");
++    close(dwpc, 18.529284819365557, 1.0e-9, "effective dewpoint");
++
++    let cape_profile = sharppyrs::extras::cape_profile(inner);
++    let level = LiftedParcelLevel {
++        pres,
++        tmpc,
++        dwpc,
++        parcel_type: ParcelType::UserDefined { pres, tmpc, dwpc },
++    };
++    let effective = sharppyrs::extras::parcelx_sharppy(&cape_profile, &level, None, None);
++    close(effective.bplus, 161.51001436817492, 1.0e-6, "effective CAPE");
++    close(effective.bminus, -223.55488965696202, 1.0e-6, "effective CIN");
++    close(effective.lclpres, 910.3833165048057, 1.0e-6, "effective LCL");
++    close(effective.elpres, 410.7, 1.0e-9, "effective EL");
++
++    let derived = DerivedParams::compute(&profile);
++    let single_level_wind = profile.inner.interp_wind(profile.ebottom);
++    close(
++        derived.mean_eff.0,
++        single_level_wind.0,
++        1.0e-9,
++        "single-level effective mean u",
++    );
++    close(
++        derived.mean_eff.1,
++        single_level_wind.1,
++        1.0e-9,
++        "single-level effective mean v",
++    );
++    close(
++        derived.srw_eff.0,
++        single_level_wind.0 - profile.srwind.0,
++        1.0e-9,
++        "single-level effective storm-relative u",
++    );
++    close(
++        derived.srw_eff.1,
++        single_level_wind.1 - profile.srwind.1,
++        1.0e-9,
++        "single-level effective storm-relative v",
++    );
++    close(
++        derived.conv_t_f,
++        92.912,
++        1.0e-9,
++        "truncated-CAPE convective temperature",
++    );
++}
++
++#[test]
++fn no_effective_layer_masks_critical_angle_and_preserves_moshe_legacy() {
++    let profile = Profile::new(bufkit_case(25)).unwrap();
++    assert!(!profile.ebottom.is_finite());
++    assert!(!profile.etop.is_finite());
++
++    let derived = DerivedParams::compute(&profile);
++    assert_eq!(derived.stp_cin, 0.0);
++    assert!(!derived.right_critical_angle.is_finite());
++    assert!(!derived.ebwd.0.is_finite() && !derived.ebwd.1.is_finite());
++    assert!(!derived.mean_eff.0.is_finite() && !derived.mean_eff.1.is_finite());
++    assert!(!derived.mean_ebw.0.is_finite() && !derived.mean_ebw.1.is_finite());
++    assert!(!derived.srw_eff.0.is_finite() && !derived.srw_eff.1.is_finite());
++    assert!(!derived.srw_ebw.0.is_finite() && !derived.srw_ebw.1.is_finite());
++    close(
++        derived.modified_sherbe,
++        -96.86579886250205,
++        1.0e-3,
++        "no-effective-layer modified SHERBE",
++    );
++}
++
++#[test]
++fn southern_hemisphere_stp_preserves_legacy_signs() {
++    let mut data = hrrr_example();
++    data.latitude = Some(-36.675);
++    let profile = Profile::new(data).unwrap();
++    let derived = DerivedParams::compute(&profile);
++    assert_eq!(derived.stp_cin, 0.0);
++    assert!(derived.stp_cin.is_sign_negative());
++    close(derived.stp_fixed, 3.3052229135683477, 5.0e-5, "SH fixed STP");
++}
++
++#[test]
++fn constant_wind_column_preserves_legacy_zero_composites() {
++    let mut data = hrrr_example();
++    data.wdir.fill(0.0);
++    data.wspd.fill(0.0);
++    let profile = Profile::new(data).unwrap();
++    assert!(sharppyrs::extras::has_constant_wind(&profile.inner));
++    assert!(profile.srwind.0.is_nan() && profile.srwind.1.is_nan());
++
++    let derived = DerivedParams::compute(&profile);
++    assert_eq!(derived.right_scp, 0.0);
++    assert_eq!(derived.left_scp, 0.0);
++    assert_eq!(derived.stp_cin, 0.0);
++    assert_eq!(derived.stp_fixed, 0.0);
++    assert_eq!(derived.lscp, 0.0);
++}
++
++#[test]
++fn truncated_upper_moisture_does_not_invent_an_mpl_height() {
++    let mut data = hrrr_example();
++    for dewpoint in data.dwpc.iter_mut().skip(30) {
++        *dewpoint = f64::NAN;
++    }
++    let profile = Profile::new(data).unwrap();
++    for parcel in [&profile.sfcpcl, &profile.fcstpcl, &profile.mupcl, &profile.mlpcl] {
++        if !parcel.mplpres.is_finite() {
++            assert!(!parcel.mplhght.is_finite());
++        }
++    }
++}

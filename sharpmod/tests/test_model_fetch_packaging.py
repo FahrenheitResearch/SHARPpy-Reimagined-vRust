@@ -87,7 +87,7 @@ def test_native_binary_license_notices_are_bundled_and_exact():
     for project, revision in {
         "sharppyrs": "958bcd685b1e28b8fce0ab5c7b8daea3cdd993aa",
         "sharprs": "1601674e8be0a07eaa48a50ddf6b2cedc035324f",
-        "ecape-rs": "82922534c02a888e773c50463b5a49d535606276",
+        "ecape-rs": "414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0",
     }.items():
         assert project in native_notices
         assert revision in native_notices

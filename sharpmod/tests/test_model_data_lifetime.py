@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import time
 
+import pytest
+
 from sharpmod import gui, gui_picker, gui_workers
 from sharpmod.model_hour_cache import ModelHourCache
 from sharpmod.tests.era5_synth import make_era5_dataset
@@ -169,6 +171,10 @@ def test_model_fetch_checks_grib_runtime_before_starting_worker(monkeypatch):
         _model_lat=SimpleNamespace(value=lambda: 35.63),
         _model_lon=SimpleNamespace(value=lambda: -97.44),
         _model_point_ok=lambda: True,
+        _model_selected_fxx=lambda: 0,
+        _model_run_time=lambda: datetime(
+            2026, 7, 15, 0, tzinfo=timezone.utc),
+        _model_selected_hour_is_cached=lambda: False,
         statusBar=lambda: SimpleNamespace(showMessage=statuses.append),
     )
 
@@ -196,6 +202,37 @@ def test_model_fetch_checks_grib_runtime_before_starting_worker(monkeypatch):
         "ecCodes binary is unavailable"
     ]
     assert statuses == ["Forecast model support unavailable"]
+
+
+def test_cached_model_fetch_skips_grib_runtime_preflight(monkeypatch):
+    """An existing .rws hour must not depend on optional GRIB libraries."""
+    picker = SimpleNamespace(
+        _model_worker=None,
+        _model_config=lambda: model_extract.get_config("hrrr"),
+        _model_lat=SimpleNamespace(value=lambda: 35.63),
+        _model_lon=SimpleNamespace(value=lambda: -97.44),
+        _model_point_ok=lambda: True,
+        _model_selected_fxx=lambda: 0,
+        _model_run_time=lambda: datetime(
+            2026, 7, 15, 0, tzinfo=timezone.utc),
+        _model_selected_hour_is_cached=lambda: True,
+        _cancel_model_prefetch=lambda **_kwargs: None,
+        _model_member_value=lambda: None,
+    )
+
+    monkeypatch.setattr(
+        model_extract, "require_runtime_dependencies",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("cached fetch preflighted GRIB runtime")),
+    )
+    monkeypatch.setattr(
+        gui_picker.tempfile, "mkdtemp",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("reached cached fetch setup")),
+    )
+
+    with pytest.raises(RuntimeError, match="reached cached fetch setup"):
+        gui.PickerWindow._model_fetch(picker)
 
 
 class _FakeProgressWidget:

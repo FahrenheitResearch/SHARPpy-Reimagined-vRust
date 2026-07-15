@@ -20,6 +20,7 @@ def test_gui_responsibility_modules_import_independently():
         "sharpmod.gui_workers",
         "sharpmod.gui_maps",
         "sharpmod.gui_sessions",
+        "sharpmod.gui_compare",
         "sharpmod.gui_viewer",
         "sharpmod.gui_picker",
     )
@@ -54,6 +55,7 @@ def test_lower_gui_layers_do_not_import_picker_controller():
         "gui_workers.py",
         "gui_maps.py",
         "gui_sessions.py",
+        "gui_compare.py",
         "gui_viewer.py",
     )
 

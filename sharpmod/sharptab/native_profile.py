@@ -23,6 +23,7 @@ from sharppy.sharptab import thermo as sp_thermo
 from sharppy.sharptab import utils as sp_utils
 from sharppy.sharptab import watch_type as sp_watch_type
 from sharppy.sharptab import winds as sp_winds
+from sharppy.io import qc_tools as sp_qc_tools
 
 from . import native_analysis, sars_cache
 
@@ -65,13 +66,70 @@ def _parcel(values):
     return parcel
 
 
+def _initialize_native_inputs(prof, kwargs):
+    """Establish ``BasicProfile``'s input contract without derived work.
+
+    Rust supplies the virtual-temperature, thermodynamic, and wet-bulb
+    columns on a successful native analysis.  Calling ``BasicProfile.__init__``
+    first needlessly calculates those same seven columns in Python.  Keep the
+    inexpensive validation, masking, wind conversion, metadata, surface/top,
+    and optional strict-QC behavior byte-for-byte compatible with the vendored
+    initializer, then let :meth:`NativeConvectiveProfile._apply_native` publish
+    the native derived arrays.
+
+    This is deliberately local instead of changing the vendored SHARPpy base
+    classes: a failed native call can still restart construction through the
+    complete ``ConvectiveProfile`` initializer below.
+    """
+    sp_profile.Profile.__init__(prof, **kwargs)
+
+    # BasicProfile defaults strict QC to true even though Profile defaults it
+    # to false.  Preserve the two-stage behavior, including Profile's early QC
+    # when strictQC=True was supplied explicitly.
+    prof.strictQC = kwargs.get("strictQC", True)
+
+    if prof.wdir is not None:
+        prof.wdir[prof.wdir == prof.missing] = ma.masked
+        prof.wspd[prof.wspd == prof.missing] = ma.masked
+        prof.wdir[prof.wspd.mask] = ma.masked
+        prof.wspd[prof.wdir.mask] = ma.masked
+        prof.u, prof.v = sp_utils.vec2comp(prof.wdir, prof.wspd)
+    elif prof.u is not None:
+        prof.u[prof.u == prof.missing] = ma.masked
+        prof.v[prof.v == prof.missing] = ma.masked
+        prof.u[prof.v.mask] = ma.masked
+        prof.v[prof.u.mask] = ma.masked
+        prof.wdir, prof.wspd = sp_utils.comp2vec(prof.u, prof.v)
+
+    if prof.tmp_stdev is not None:
+        prof.dew_stdev[prof.dew_stdev == prof.missing] = ma.masked
+        prof.tmp_stdev[prof.tmp_stdev == prof.missing] = ma.masked
+        prof.dew_stdev.set_fill_value(prof.missing)
+        prof.tmp_stdev.set_fill_value(prof.missing)
+
+    if prof.omeg is not None:
+        prof.omeg[prof.omeg == prof.missing] = ma.masked
+    else:
+        prof.omeg = ma.masked_all(len(prof.hght))
+
+    sp_qc_tools.areProfileArrayLengthEqual(prof)
+    for name in ("pres", "hght", "tmpc", "dwpc"):
+        values = getattr(prof, name)
+        values[values == prof.missing] = ma.masked
+
+    prof.sfc = prof.get_sfc()
+    prof.top = prof.get_top()
+    if prof.strictQC is True:
+        prof.checkDataIntegrity()
+
+
 class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
     """Drop-in ``ConvectiveProfile`` with native-first calculations."""
 
     def __init__(self, **kwargs):
-        # BasicProfile establishes SHARPpy's validated/masked object contract.
-        # The native result immediately replaces its calculated profile arrays.
-        sp_profile.BasicProfile.__init__(self, **kwargs)
+        # Establish only the validated/masked input contract. Rust immediately
+        # supplies the expensive BasicProfile-derived thermodynamic columns.
+        _initialize_native_inputs(self, kwargs)
         self.user_srwind = None
         native = native_analysis.try_analyze_profile(self)
         if native is None:
@@ -84,13 +142,16 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
 
         self._sharpmod_native_analysis = native
         self._sharpmod_calculation_backend = "sharppyrs/sharprs"
-        self._sharpmod_python_fallbacks = (
-            "fire-pbl-details",
-            "precipitation-source/layer-energies",
+        self._apply_native(native, reset_bunkers=True)
+        fallbacks = [
             "SARS-analog-databases",
             "PWV-station-climatology",
-        )
-        self._apply_native(native, reset_bunkers=True)
+        ]
+        if not self._sharpmod_native_fire_pbl:
+            fallbacks.insert(0, "fire-pbl-details")
+        if not self._sharpmod_native_precip:
+            fallbacks.insert(0, "precipitation-source/layer-energies")
+        self._sharpmod_python_fallbacks = tuple(fallbacks)
         self._run_python_only_features()
         _LOGGER.info(
             "Sounding analysis backend=%s fallbacks=%s",
@@ -103,9 +164,11 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
         # The vendored methods also recompute native fire, winter, SHIP, and
         # parcel values, which are immediately overwritten and cost tens of
         # milliseconds on every cached map click.
-        self._run_python_fire_details()
-        self._run_python_precip_details()
-        self._apply_native_precip_type()
+        if not self._sharpmod_native_fire_pbl:
+            self._run_python_fire_details()
+        if not self._sharpmod_native_precip:
+            self._run_python_precip_details()
+            self._apply_native_precip_type()
         self._run_python_sars_matches()
 
         try:
@@ -213,11 +276,28 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
             self.matches = self.right_matches
 
     def _apply_native(self, native, *, reset_bunkers=False):
-        arrays = native["arrays"]
-        for name in (
+        # ``native_analysis`` fills only bracketed internal wind gaps before
+        # calling Rust so sparse observed profiles still receive complete
+        # kinematic calculations.  Those normalized columns are calculation
+        # inputs, not new observations: keep BasicProfile's public core arrays
+        # (and their masks) intact.  Slice at the original physical surface so
+        # a leading all-missing row such as the one in the bundled OAX profile
+        # is removed in the same normalization that Rust receives.
+        original_sfc = int(getattr(self, "sfc", 0) or 0)
+        public_core = {
+            name: ma.asarray(getattr(self, name))[original_sfc:].copy()
+            for name in (
                 "pres", "hght", "tmpc", "dwpc", "wdir", "wspd", "omeg",
-                "u", "v", "logp", "vtmp", "theta", "thetae", "wvmr",
-                "relh", "wetbulb"):
+                "u", "v",
+            )
+        }
+
+        arrays = native["arrays"]
+        for name, values in public_core.items():
+            setattr(self, name, values)
+        for name in (
+                "logp", "vtmp", "theta", "thetae", "wvmr", "relh",
+                "wetbulb"):
             setattr(self, name, _array(arrays[name]))
 
         profile_values = native["profile"]
@@ -244,6 +324,11 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
                 setattr(self, name, tuple(value))
             else:
                 setattr(self, name, _masked_scalar(value))
+        # The local pre-Rust SFC-500 m helper represents an unavailable storm
+        # motion as one masked value, not a two-component masked tuple.
+        # Retain that public shape for degenerate constant-wind profiles.
+        if all(item is ma.masked for item in _tuple(derived["srw_sfc_500m"])):
+            self.srw_sfc_500m = ma.masked
         self.mupcl.brnshear = _masked_scalar(derived["brnshear"])
         if self.mupcl.brnshear is not ma.masked and self.mupcl.brnshear > 0:
             self.mupcl.brn = self.mupcl.bplus / self.mupcl.brnshear
@@ -312,6 +397,23 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
                 setattr(self, f"{side}_srw_{layer}",
                         _tuple(sp_utils.comp2vec(*comp)))
 
+        # ConvectiveProfile uses three-element MISSING lists for these
+        # effective-layer vectors when no layer exists (rather than the usual
+        # two-component tuples). Some downstream callers and the release
+        # parity contract observe that historical shape, so retain it at the
+        # object-model boundary while Rust keeps its internal `(u, v)` type.
+        if self.ebottom is ma.masked or self.etop is ma.masked:
+            missing3 = [sp_constants.MISSING] * 3
+            self.ebwd = missing3.copy()
+            self.mean_eff = missing3.copy()
+            self.mean_ebw = missing3.copy()
+            self.right_srw_eff = missing3.copy()
+            self.right_srw_ebw = missing3.copy()
+            self.left_srw_eff = missing3.copy()
+            self.left_srw_ebw = missing3.copy()
+            self.right_critical_angle = ma.masked
+            self.left_critical_angle = ma.masked
+
         self.upshear_downshear = _tuple(extra["upshear_downshear"])
         if float(getattr(self, "latitude", 0.0) or 0.0) < 0:
             prefix = "left"
@@ -348,6 +450,12 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
 
     def _apply_native_fire(self, native):
         fire = native["extra"]["fire"]
+        pbl_fields = (
+            "ppbl_top", "pbl_h", "sfc_rh", "rh01km", "pblrh",
+            "meanwind01km", "meanwindpbl", "pblmaxwind",
+        )
+        self._sharpmod_native_fire_pbl = all(
+            name in fire for name in pbl_fields)
         self.fosberg = _masked_scalar(fire["fosberg"])
         self.haines_hght = {
             "Low": sp_constants.HAINES_LOW,
@@ -356,15 +464,38 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
         }.get(fire["haines_hght"], ma.masked)
         for name in ("haines_low", "haines_mid", "haines_high", "bplus_fire"):
             setattr(self, name, _masked_scalar(fire[name]))
+        if self._sharpmod_native_fire_pbl:
+            for name in ("ppbl_top", "pbl_h", "sfc_rh", "rh01km", "pblrh"):
+                setattr(self, name, _masked_scalar(fire[name]))
+            for name in ("meanwind01km", "meanwindpbl", "pblmaxwind"):
+                setattr(self, name, _tuple(fire[name]))
 
     def _apply_native_winter(self, native):
         winter = native["extra"]["winter"]
         for name in ("dgz_pbot", "dgz_ptop", "dgz_meanrh", "dgz_pw", "dgz_meanq"):
             setattr(self, name, _masked_scalar(winter[name]))
-        try:
-            self.oprh = self.dgz_meanomeg * self.dgz_pw * (self.dgz_meanrh / 100.0)
-        except (AttributeError, TypeError, ValueError):
-            self.oprh = ma.masked
+        precip_fields = (
+            "dgz_meanomeg", "oprh", "plevel", "phase", "tmp", "st",
+            "tpos", "tneg", "ttop", "tbot", "wpos", "wneg", "wtop",
+            "wbot", "precip_type",
+        )
+        self._sharpmod_native_precip = all(
+            name in winter for name in precip_fields)
+        if self._sharpmod_native_precip:
+            for name in (
+                    "dgz_meanomeg", "oprh", "plevel", "tmp", "tpos",
+                    "tneg", "ttop", "tbot", "wpos", "wneg", "wtop",
+                    "wbot"):
+                setattr(self, name, _masked_scalar(winter[name]))
+            self.phase = int(winter["phase"])
+            self.st = str(winter["st"])
+            self.precip_type = str(winter["precip_type"])
+        else:
+            try:
+                self.oprh = self.dgz_meanomeg * self.dgz_pw * (
+                    self.dgz_meanrh / 100.0)
+            except (AttributeError, TypeError, ValueError):
+                self.oprh = ma.masked
 
     def _apply_native_precip_type(self):
         try:
@@ -449,9 +580,14 @@ class NativeConvectiveProfile(sp_profile.ConvectiveProfile):
             sp_profile.ConvectiveProfile.get_kinematics(self)
             sp_profile.ConvectiveProfile.get_severe(self)
             self._sharpmod_calculation_backend = "python-fallback-after-native"
+            self._apply_native_watch()
             return
         self._sharpmod_native_analysis = native
         self._apply_native(native, reset_bunkers=False)
+        # Storm-relative severe ingredients changed with the motion vector;
+        # keep the public watch labels synchronized in the same interaction.
+        # Upstream's set_srright/set_srleft omit this final refresh.
+        self._apply_native_watch()
 
     def set_srright(self, rm_u, rm_v):
         current = tuple(self.user_srwind or self.bunkers)

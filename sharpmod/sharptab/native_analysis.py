@@ -53,12 +53,167 @@ def classify_watch(values: dict) -> str:
     return str(_extension().classify_watch(dict(values)))
 
 
+def streamwiseness(height_msl_m, u_kts, v_kts, *, sfc, storm_motion,
+                   max_height_m=6000.0, step_m=100.0):
+    """Calculate streamwiseness in Rust and return three NumPy arrays.
+
+    The returned tuple is ``(height_m, percent, signed_percent)``. ``percent``
+    is ``(omega_streamwise / omega_horizontal_mag) ** 2 * 100``;
+    ``signed_percent`` carries the projection sign only for directional
+    shading. ``None`` means the supplied profile has no usable streamwiseness
+    samples; absence of the native feature raises
+    :class:`NativeAnalysisUnavailable` so the visualization layer can select
+    its explicit Python fallback.
+    """
+    extension = _extension()
+    function = getattr(extension, "streamwiseness", None)
+    if function is None:
+        raise NativeAnalysisUnavailable(
+            "native extension does not expose streamwiseness")
+
+    arrays = []
+    for name, values in (
+            ("height_msl_m", height_msl_m),
+            ("u_kts", u_kts),
+            ("v_kts", v_kts)):
+        array = np.asarray(
+            ma.filled(ma.asarray(values, dtype=float), np.nan), dtype=float)
+        if array.ndim != 1:
+            raise ValueError(f"{name} must be one-dimensional")
+        arrays.append(array)
+    if not (len(arrays[0]) == len(arrays[1]) == len(arrays[2])):
+        raise ValueError("height_msl_m, u_kts, and v_kts must have equal lengths")
+
+    try:
+        motion = tuple(float(value) for value in storm_motion)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("storm_motion must contain two finite components") from exc
+    if len(motion) != 2 or not np.all(np.isfinite(motion)):
+        raise ValueError("storm_motion must contain two finite components")
+
+    result = function(
+        *[array.tolist() for array in arrays],
+        int(sfc),
+        motion[0],
+        motion[1],
+        max_height_m=float(max_height_m),
+        step_m=float(step_m),
+    )
+    if result is None:
+        return None
+    if len(result) != 3:
+        raise NativeAnalysisUnavailable("malformed native streamwiseness result")
+    converted = tuple(np.asarray(values, dtype=float) for values in result)
+    if any(values.ndim != 1 for values in converted) or not (
+            len(converted[0]) == len(converted[1]) == len(converted[2])):
+        raise NativeAnalysisUnavailable("malformed native streamwiseness arrays")
+    return converted
+
+
 def _values(value, *, optional=False):
     if value is None:
         return None if optional else []
     array = ma.asarray(value, dtype=float)
     data = ma.filled(array, np.nan).astype(float, copy=False)
     return data.tolist()
+
+
+def _interpolate_internal_winds(pres, wdir, wspd):
+    """Fill only bracketed missing winds using SHARPpy's log-p convention.
+
+    Observed soundings commonly report thermodynamic levels between mandatory
+    wind levels.  Legacy SHARPpy interpolates vector components across those
+    internal gaps; passing the gaps to the stricter Rust profile unchanged can
+    make an otherwise valid hodograph and every storm-relative diagnostic
+    undefined.  Work in u/v space so directions crossing north interpolate
+    correctly, and deliberately leave leading/trailing gaps untouched.
+    """
+    pres = np.asarray(pres, dtype=float)
+    wdir = np.asarray(wdir, dtype=float).copy()
+    wspd = np.asarray(wspd, dtype=float).copy()
+    valid = (
+        np.isfinite(pres) & (pres > 0.0)
+        & np.isfinite(wdir) & np.isfinite(wspd) & (wspd >= 0.0)
+    )
+    missing = (
+        np.isfinite(pres) & (pres > 0.0)
+        & ~(np.isfinite(wdir) & np.isfinite(wspd))
+    )
+    if np.count_nonzero(valid) < 2 or not np.any(missing):
+        return wdir, wspd
+
+    radians = np.deg2rad(wdir[valid])
+    u_valid = -wspd[valid] * np.sin(radians)
+    v_valid = -wspd[valid] * np.cos(radians)
+    logp_valid = np.log(pres[valid])
+    order = np.argsort(logp_valid)
+    logp_valid = logp_valid[order]
+    u_valid = u_valid[order]
+    v_valid = v_valid[order]
+
+    logp = np.log(pres[missing])
+    bracketed = (
+        (logp >= logp_valid[0]) & (logp <= logp_valid[-1])
+    )
+    if not np.any(bracketed):
+        return wdir, wspd
+    missing_indices = np.flatnonzero(missing)[bracketed]
+    targets = logp[bracketed]
+    u = np.interp(targets, logp_valid, u_valid)
+    v = np.interp(targets, logp_valid, v_valid)
+    wspd[missing_indices] = np.hypot(u, v)
+    wdir[missing_indices] = (
+        np.rad2deg(np.arctan2(-u, -v)) + 360.0
+    ) % 360.0
+    return wdir, wspd
+
+
+def _normalized_columns(prof):
+    """Return the physical SHARPpy profile seen by the native analyzer.
+
+    ``BasicProfile.sfc`` can follow one or more placeholder pressure levels.
+    Slice those non-physical leading rows before crossing the bridge, then
+    interpolate only internal (never exterior) missing wind observations.
+    """
+    names = ("pres", "hght", "tmpc", "dwpc", "wdir", "wspd")
+    columns = {
+        name: np.asarray(
+            ma.filled(ma.asarray(getattr(prof, name), dtype=float), np.nan),
+            dtype=float,
+        )
+        for name in names
+    }
+    size = len(columns["pres"])
+    if any(len(values) != size for values in columns.values()):
+        raise ValueError("sounding columns must have identical lengths")
+    start = int(getattr(prof, "sfc", 0) or 0)
+    if start < 0 or start >= size:
+        raise ValueError("profile surface index is outside the sounding")
+    columns = {name: values[start:] for name, values in columns.items()}
+    # Preserve which vectors were actually reported before filling bracketed
+    # gaps for Rust's interpolation-heavy kinematic calculations. Diagnostics
+    # such as PBL maximum wind must ignore those synthetic interpolation
+    # levels just as SHARPpy's masked observation array does.
+    columns["observed_wind_valid"] = (
+        np.isfinite(columns["pres"])
+        & (columns["pres"] > 0.0)
+        & np.isfinite(columns["wdir"])
+        & np.isfinite(columns["wspd"])
+        & (columns["wspd"] >= 0.0)
+    )
+    columns["wdir"], columns["wspd"] = _interpolate_internal_winds(
+        columns["pres"], columns["wdir"], columns["wspd"])
+
+    omeg = getattr(prof, "omeg", None)
+    if omeg is None:
+        columns["omeg"] = None
+    else:
+        omeg = np.asarray(
+            ma.filled(ma.asarray(omeg, dtype=float), np.nan), dtype=float)
+        if len(omeg) != size:
+            raise ValueError("omeg must have the same length as pres")
+        columns["omeg"] = omeg[start:]
+    return columns
 
 
 def _finite_optional(value):
@@ -86,14 +241,13 @@ def analyze_profile(prof, *, storm_motion=None) -> dict:
         if len(storm_motion) != 4:
             raise ValueError("storm_motion must contain right/left u/v components")
 
+    columns = _normalized_columns(prof)
     result = extension.analyze(
-        _values(prof.pres),
-        _values(prof.hght),
-        _values(prof.tmpc),
-        _values(prof.dwpc),
-        _values(prof.wdir),
-        _values(prof.wspd),
-        omeg=_values(getattr(prof, "omeg", None), optional=True),
+        *[columns[name].tolist() for name in (
+            "pres", "hght", "tmpc", "dwpc", "wdir", "wspd")],
+        omeg=(None if columns["omeg"] is None
+              else columns["omeg"].tolist()),
+        observed_wind_valid=columns["observed_wind_valid"].tolist(),
         latitude=latitude,
         longitude=longitude,
         missing=missing,
@@ -120,13 +274,10 @@ def lift_user_parcel(prof, pres, tmpc, dwpc, *, pbot=None, ptop=None):
     missing = _finite_optional(getattr(prof, "missing", -9999.0))
     if missing is None:
         missing = -9999.0
+    columns = _normalized_columns(prof)
     return dict(_extension().lift_parcel(
-        _values(prof.pres),
-        _values(prof.hght),
-        _values(prof.tmpc),
-        _values(prof.dwpc),
-        _values(prof.wdir),
-        _values(prof.wspd),
+        *[columns[name].tolist() for name in (
+            "pres", "hght", "tmpc", "dwpc", "wdir", "wspd")],
         float(pres),
         float(tmpc),
         float(dwpc),

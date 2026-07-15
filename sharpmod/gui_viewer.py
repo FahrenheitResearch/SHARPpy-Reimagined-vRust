@@ -323,6 +323,14 @@ def compose_interactive(config, prof_col, controller, *, stn_id=None,
     # (the vendored Save Image/Text default to a hidden temp dir with no name).
     _install_export_menu(win, prof_col, controller)
     _install_analysis_actions(win, controller)
+    try:
+        # Legacy Python analysis is intentionally imported/constructed only
+        # after the user triggers this action; installing it adds no work to
+        # the normal Rust-backed sounding load.
+        from sharpmod.gui_compare import install_profile_comparison
+        install_profile_comparison(win)
+    except Exception:
+        _LOGGER.exception("Could not install Rust/Python comparison action")
     _install_units_menu(win, controller)
     try:
         _apply_unit_preferences_to_window(win, controller._config())

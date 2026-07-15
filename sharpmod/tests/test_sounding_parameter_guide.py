@@ -82,6 +82,8 @@ def test_critical_implementation_corrections_are_documented() -> None:
         "is the linear predictor (logit), not a probability",
         "It is **not** the displayed NCAPE value above",
         "the top is the **last passing level**",
+        "corrected squared projection ratio",
+        "retained only to select directional",
         "LCL | Neutral white",
     )
     for statement in required:
@@ -96,3 +98,5 @@ def test_fixed_stp_and_ecape_equations_are_not_regressed() -> None:
     assert r"a=\frac{\psi}{V_{SR}^{2}}" in text
     assert r"\mathrm{CAPE}-\psi N" in text
     assert r"k^2=0.18" in text
+    assert r"\frac{\omega_{streamwise}}{\lVert\vec\omega_h\rVert}" in text
+    assert r"\right)^2" in text

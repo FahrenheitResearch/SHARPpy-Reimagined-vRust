@@ -76,7 +76,7 @@ SOFTWARE.
 ecape-rs
 --------
 Source: https://github.com/FahrenheitResearch/ecape-rs
-Revision: 82922534c02a888e773c50463b5a49d535606276
+Revision: 414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0
 
 MIT License
 

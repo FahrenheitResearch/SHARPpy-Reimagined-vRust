@@ -72,6 +72,11 @@ def analytic_ecape(pres, hght, tmpc, dwpc, u_knots, v_knots,
         return None
     if not all(np.isfinite(value) for value in (ecape, ncape, cape)):
         return None
-    if ecape < 0.0 or cape < 0.0 or ecape > cape + 1.0e-6:
+    # The published analytic expression can exceed its internally diagnosed
+    # undiluted CAPE slightly in weak-instability cases.  ecape-parcel-py does
+    # not reject that result, and the public profile API applies its separate
+    # SHARPpy-MUCAPE contract bound before display.  Treat only negative or
+    # non-finite native output as malformed here.
+    if ecape < 0.0 or cape < 0.0:
         return None
     return NativeEcapeResult(ecape=ecape, ncape=ncape, cape=cape)

@@ -118,6 +118,8 @@ from qtpy.QtWidgets import (
 )
 
 _STABLE_GUI_RUNTIME_ENV = "SHARPMOD_GUI_STABLE_RUNTIME"
+_MODEL_CLICK_DEBOUNCE_MS = 300
+_CACHED_MODEL_CLICK_DEBOUNCE_MS = 40
 
 
 def _project_gui_runtime() -> tuple[Path, Path] | None:
@@ -232,8 +234,8 @@ class PickerWindow(QMainWindow):
         self._model_viewer_menu: str | None = None
         self._model_click_timer = QTimer(self)
         self._model_click_timer.setSingleShot(True)
-        self._model_click_timer.setInterval(300)
-        self._model_click_timer.timeout.connect(self._model_fetch)
+        self._model_click_timer.setInterval(_MODEL_CLICK_DEBOUNCE_MS)
+        self._model_click_timer.timeout.connect(self._model_dispatch_map_click)
         self._model_disk_cache = ModelDiskCache()
         try:
             self._model_disk_cache.prune()
@@ -1566,6 +1568,9 @@ class PickerWindow(QMainWindow):
             f"Run {run:%Y-%m-%d %H}Z  \u2192  Valid {valid:%Y-%m-%d %H}Z")
         if hasattr(self, "_model_availability"):
             self._queue_model_availability()
+        # Date, cycle, and forecast-hour changes can move into or out of the
+        # local .rws store without changing the selected point.
+        self._model_update_fetch_state()
 
     def _model_member_value(self) -> str | None:
         if not hasattr(self, "_model_member") \
@@ -1684,17 +1689,22 @@ class PickerWindow(QMainWindow):
         finally:
             self._model_syncing_point = False
         self._model_update_fetch_state()
-        # The first request remains explicit so an exploratory map click never
-        # starts a download. Once a model viewer exists, later single clicks
-        # refresh that same viewer. Debouncing absorbs double-clicks and rapid
-        # point corrections into one request.
-        if self._model_viewer_is_open() \
+        # A cached hour is safe to browse directly: the first click opens its
+        # viewer and later clicks replace that profile in place. Preserve the
+        # existing viewer's refresh behavior for uncached hours, while an
+        # uncached first exploratory click remains selection-only. Debouncing
+        # absorbs double-clicks and rapid point corrections into one request.
+        cached_hour = self._model_selected_hour_is_cached()
+        if (cached_hour or self._model_viewer_is_open()) \
                 and self._model_worker is None \
                 and getattr(self, "_model_cache_worker", None) is None:
+            self._model_click_timer.setInterval(
+                _CACHED_MODEL_CLICK_DEBOUNCE_MS if cached_hour
+                else _MODEL_CLICK_DEBOUNCE_MS)
             self._model_click_timer.start()
 
     def _model_activate_point(self, _lat: float, _lon: float) -> None:
-        """Fetch immediately for a double-click without a queued duplicate."""
+        """Honor an explicit double-click without a queued duplicate."""
         self._model_click_timer.stop()
         self._model_fetch()
 
@@ -1735,6 +1745,18 @@ class PickerWindow(QMainWindow):
         old collection first; otherwise its duplicate-name guard would merely
         focus stale data rather than install the new profile.
         """
+        # An on-demand Python reference is a separate, temporary collection.
+        # Return to the cached Rust source and remove that reference before a
+        # map click swaps the source in place, so a completed background job
+        # can never reintroduce values for the previous point.
+        prepare_comparison = getattr(
+            viewer, "_sharpmod_prepare_profile_replacement", None)
+        if callable(prepare_comparison):
+            try:
+                prepare_comparison()
+            except Exception:  # noqa: BLE001 - comparison is optional UI
+                _LOGGER.debug(
+                    "model_fetch.comparison_cleanup_failed", exc_info=True)
         old_menu = getattr(self, "_model_viewer_menu", None)
         new_menu = viewer.createMenuName(prof_col)
         replace_started = time.monotonic()
@@ -1921,6 +1943,34 @@ class PickerWindow(QMainWindow):
             "Download and decode this complete model hour into the local "
             ".rws store for fast follow-up map clicks.")
 
+    def _model_selected_hour_is_cached(self) -> bool:
+        """Whether the exact selected hour can be opened without downloading."""
+        cfg = self._model_config()
+        if cfg is None:
+            return False
+        try:
+            from sharpmod.tools import rusty_weather
+            return bool(
+                rusty_weather.is_available(cfg.key)
+                and rusty_weather.hour_is_cached(
+                    cfg.key, self._model_run_time(),
+                    self._model_selected_fxx())
+            )
+        except Exception:  # noqa: BLE001 - a map selection must stay harmless
+            _LOGGER.debug(
+                "model_fetch.cached_click_check_failed model=%s", cfg.key,
+                exc_info=True)
+            return False
+
+    def _model_dispatch_map_click(self) -> None:
+        """Load a safe first cached point or refresh an existing model viewer."""
+        if not (self._model_selected_hour_is_cached()
+                or self._model_viewer_is_open()):
+            _LOGGER.info(
+                "model_fetch.map_click_skipped reason=uncached_first_point")
+            return
+        self._model_fetch()
+
     def _model_update_fetch_state(self) -> None:
         if not hasattr(self, "_model_fetch_btn") \
                 or not hasattr(self, "_model_point_status"):
@@ -1936,22 +1986,52 @@ class PickerWindow(QMainWindow):
         lat = float(self._model_lat.value())
         lon = float(self._model_lon.value())
         ok = self._model_point_ok()
+        cached_hour = self._model_selected_hour_is_cached()
         _LOGGER.debug(
-            "model_fetch.ui_state model=%s point_ok=%s busy=%s lat=%.4f "
-            "lon=%.4f",
-            cfg.key, ok, busy, lat, lon)
+            "model_fetch.ui_state model=%s point_ok=%s busy=%s cached=%s "
+            "lat=%.4f lon=%.4f",
+            cfg.key, ok, busy, cached_hour, lat, lon)
         if ok:
-            self._model_point_status.setText(
-                f"Selected {lat:.4f}, {lon:.4f} inside {cfg.domain}")
+            point_text = f"Selected {lat:.4f}, {lon:.4f} inside {cfg.domain}"
+            if cached_hour:
+                point_text += (
+                    " — hour cached; map clicks display locally with no "
+                    "download")
+            self._model_point_status.setText(point_text)
         else:
             self._model_point_status.setText(
                 f"Selected {lat:.4f}, {lon:.4f} is outside {cfg.label} "
                 f"{cfg.domain} coverage")
         self._model_fetch_btn.setEnabled(ok and not busy)
+        if not busy:
+            if cached_hour:
+                self._model_fetch_btn.setText(
+                    "Display Cached Forecast Sounding")
+                self._model_fetch_btn.setToolTip(
+                    "Display this point directly from the local model-hour "
+                    "cache. No download is needed.")
+            else:
+                self._model_fetch_btn.setText(
+                    "Fetch && Display Forecast Sounding")
+                self._model_fetch_btn.setToolTip(
+                    "Fetch the selected point sounding and display it.")
         if hasattr(self, "_model_cache_btn"):
             cache_available, cache_detail = self._model_cache_availability(cfg)
-            self._model_cache_btn.setEnabled(cache_available and not busy)
-            self._model_cache_btn.setToolTip(cache_detail)
+            self._model_cache_btn.setEnabled(
+                cache_available and not cached_hour and not busy)
+            if cached_hour:
+                if not busy:
+                    self._model_cache_btn.setText(
+                        "Selected Hour Is Cached — Click Map to Display")
+                self._model_cache_btn.setToolTip(
+                    "This complete model hour is already stored locally. "
+                    "Click any covered map point to display it without a "
+                    "download.")
+            else:
+                if not busy:
+                    self._model_cache_btn.setText(
+                        "Cache This Hour for Fast Map Browsing")
+                self._model_cache_btn.setToolTip(cache_detail)
 
     def _model_fetch(self) -> None:
         # A manual button/double-click request supersedes any pending debounced
@@ -1976,24 +2056,29 @@ class PickerWindow(QMainWindow):
                 f"{cfg.label} does not cover {lat:.4f}, {lon:.4f}.")
             return
 
+        fxx = self._model_selected_fxx()
+        run_time = self._model_run_time()
+        cached_hour = self._model_selected_hour_is_cached()
+
         from sharpmod.tools import model_extract
         # Keep native GRIB imports on the main Qt thread. The HRRR Zarr path
         # itself does not need ecCodes, but its automatic fallback does, and a
         # first native import from a Windows QThread can terminate the process.
-        try:
-            model_extract.require_runtime_dependencies()
-        except model_extract.RetrievalError as exc:
-            _LOGGER.exception("model_fetch.runtime_unavailable")
-            self.statusBar().showMessage(
-                "Forecast model support unavailable")
-            QMessageBox.critical(
-                self, APP_NAME,
-                f"Forecast model support is unavailable:\n{exc}")
-            return
+        # A cached .rws point never imports or reads GRIB, so it must remain
+        # usable even when the optional cold-fetch dependencies are absent.
+        if not cached_hour:
+            try:
+                model_extract.require_runtime_dependencies()
+            except model_extract.RetrievalError as exc:
+                _LOGGER.exception("model_fetch.runtime_unavailable")
+                self.statusBar().showMessage(
+                    "Forecast model support unavailable")
+                QMessageBox.critical(
+                    self, APP_NAME,
+                    f"Forecast model support is unavailable:\n{exc}")
+                return
 
         self._cancel_model_prefetch(wait=True)
-        fxx = self._model_selected_fxx()
-        run_time = self._model_run_time()
         member = self._model_member_value()
         loc = f"{cfg.label} {lat:.2f}, {lon:.2f}"
 
@@ -2007,9 +2092,15 @@ class PickerWindow(QMainWindow):
             "download_dir=%s",
             cfg.key, run_time, fxx, lat, lon, download_dir)
 
-        self._set_model_busy(True)
-        self.statusBar().showMessage(
-            f"Fetching {cfg.label} F{fxx:03d} at {lat:.2f}, {lon:.2f}\u2026")
+        self._set_model_busy(
+            True, operation="cached" if cached_hour else "fetch")
+        if cached_hour:
+            self.statusBar().showMessage(
+                f"Loading cached {cfg.label} F{fxx:03d} at "
+                f"{lat:.2f}, {lon:.2f}\u2026")
+        else:
+            self.statusBar().showMessage(
+                f"Fetching {cfg.label} F{fxx:03d} at {lat:.2f}, {lon:.2f}\u2026")
         worker = _ModelFetchWorker(
             cfg.key, lat, lon, run_time, fxx, npz_path, loc=loc,
             member=member, download_dir=download_dir,
@@ -2151,6 +2242,8 @@ class PickerWindow(QMainWindow):
             self._model_cancel_btn.show()
             if operation == "cache":
                 self._model_cache_btn.setText("Caching Selected Hour\u2026")
+            elif operation == "cached":
+                self._model_fetch_btn.setText("Loading Cached Sounding\u2026")
             else:
                 self._model_fetch_btn.setText("Fetching\u2026")
             self._model_progress_stage = "locating"

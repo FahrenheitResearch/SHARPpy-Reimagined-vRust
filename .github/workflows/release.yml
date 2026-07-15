@@ -75,9 +75,11 @@ jobs:
           ref: ${{ env.SHARPPYRS_REV }}
           path: native/sharppyrs
 
-      - name: Apply v0.3.1 ECAPE upper-bound fix
+      - name: Apply pinned sharppyrs parity fixes
         shell: bash
-        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+        run: |
+          git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+          git -C native/sharppyrs apply ../patches/sharppyrs-sharppy-parity.patch
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -233,8 +235,10 @@ jobs:
           ref: ${{ env.SHARPPYRS_REV }}
           path: native/sharppyrs
 
-      - name: Apply v0.3.1 ECAPE upper-bound fix
-        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+      - name: Apply pinned sharppyrs parity fixes
+        run: |
+          git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+          git -C native/sharppyrs apply ../patches/sharppyrs-sharppy-parity.patch
 
       - name: Install Linux runtime libraries
         run: |
@@ -406,8 +410,10 @@ jobs:
           ref: ${{ env.SHARPPYRS_REV }}
           path: native/sharppyrs
 
-      - name: Apply v0.3.1 ECAPE upper-bound fix
-        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+      - name: Apply pinned sharppyrs parity fixes
+        run: |
+          git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+          git -C native/sharppyrs apply ../patches/sharppyrs-sharppy-parity.patch
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
