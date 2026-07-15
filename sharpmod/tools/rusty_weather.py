@@ -28,6 +28,10 @@ SCHEMA = "sharpmod.point-sounding.v1"
 SUPPORTED_MODELS = frozenset(("hrrr", "gfs", "rrfs-a"))
 
 
+class RustCacheMiss(RetrievalError):
+    """The requested model hour is not present in the durable Rust store."""
+
+
 def backend_mode():
     """Return ``auto``, ``rust``, or ``python`` from the environment."""
     mode = os.environ.get("SHARPMOD_MODEL_BACKEND", "auto").strip().lower()
@@ -80,18 +84,38 @@ def default_cache_root():
     return Path.home() / ".cache" / "sharpmod" / "rusty-weather"
 
 
-def _run_command(command, description):
+def _run_command(command, description, cancelled=None):
+    """Run one helper while allowing the Qt worker to stop the subprocess."""
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [os.fspath(part) for part in command],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            check=False,
         )
     except OSError as exc:
         raise RetrievalError(f"could not start {description}: {exc}") from exc
+
+    while True:
+        if cancelled is not None and cancelled():
+            process.terminate()
+            try:
+                process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            from sharpmod.model_transport import DownloadCancelled
+            raise DownloadCancelled(f"{description} cancelled")
+        try:
+            stdout, stderr = process.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    result = subprocess.CompletedProcess(
+        process.args, process.returncode, stdout, stderr)
     if result.returncode:
         detail = (result.stderr or result.stdout or "unknown error").strip()
         detail = detail[-2000:]
@@ -112,12 +136,40 @@ def _hour_path(cache_root, model, run_time, fxx):
             _run_id(run_time) / f"f{int(fxx):03d}.rws")
 
 
+def hour_is_cached(model, run_time, fxx, cache_root=None):
+    """Whether an exact model/run/hour can be exported without downloading."""
+    if str(model).lower() not in SUPPORTED_MODELS:
+        return False
+    root = Path(cache_root) if cache_root else default_cache_root()
+    return _hour_path(root, model, run_time, fxx).is_file()
+
+
 def _report(progress, message, percent):
     if progress is not None:
         progress(str(message), int(percent))
 
 
-def _ensure_hour(ingest, cache_root, model, run_time, fxx, progress=None):
+def _cold_source_candidates(model):
+    """Return efficient indexed providers for an explicitly cold Rust ingest.
+
+    Rusty Weather's NOMADS production path downloads whole GRIB files.  AWS
+    and Google use indexed byte ranges, so they are preferred when a caller
+    explicitly requests a full-hour native cache build.  Normal interactive
+    fetching uses the smaller upstream point/subregion transports before this
+    cold path.
+    """
+    configured = os.environ.get("SHARPMOD_RUSTY_WEATHER_SOURCE", "").strip()
+    if configured:
+        return (configured,)
+    if str(model).lower() in {"hrrr", "gfs"}:
+        return ("aws", "google")
+    if str(model).lower() == "rrfs-a":
+        return ("aws",)
+    return ()
+
+
+def _ensure_hour(ingest, cache_root, model, run_time, fxx, progress=None,
+                 cancelled=None):
     hour_path = _hour_path(cache_root, model, run_time, fxx)
     if hour_path.is_file():
         _report(progress, "Using cached model hour", 60)
@@ -129,22 +181,36 @@ def _ensure_hour(ingest, cache_root, model, run_time, fxx, progress=None):
         f"F{int(fxx):03d} via native provider",
         15,
     )
-    command = [
-        ingest,
-        "--model", model,
-        "--date", run_time.strftime("%Y%m%d"),
-        "--cycle", str(run_time.hour),
-        "--hours", str(int(fxx)),
-        "--store-root", Path(cache_root) / "store",
-        "--cache-dir", Path(cache_root) / "downloads",
-        "--profile", "sounding",
-        "--no-heavy",
-    ]
-    _run_command(command, f"Rusty Weather {model.upper()} ingest")
+    failures = []
+    for source in _cold_source_candidates(model):
+        command = [
+            ingest,
+            "--model", model,
+            "--date", run_time.strftime("%Y%m%d"),
+            "--cycle", str(run_time.hour),
+            "--hours", str(int(fxx)),
+            "--source", source,
+            "--store-root", Path(cache_root) / "store",
+            "--cache-dir", Path(cache_root) / "downloads",
+            "--profile", "sounding",
+            "--no-heavy",
+        ]
+        try:
+            _run_command(
+                command, f"Rusty Weather {model.upper()} {source} ingest",
+                cancelled=cancelled)
+            break
+        except RetrievalError as exc:
+            failures.append(f"{source}: {exc}")
+    else:
+        detail = "; ".join(failures) or "no indexed native provider"
+        raise RetrievalError(
+            f"Rusty Weather could not cache {model.upper()} from an indexed "
+            f"provider: {detail}")
     if not hour_path.is_file():
         raise RetrievalError(
             f"Rusty Weather completed without creating {hour_path}")
-    _report(progress, "Model hour cached; extracting point", 70)
+    _report(progress, "Model hour cached", 70)
     return hour_path
 
 
@@ -297,32 +363,10 @@ def json_to_npz(json_path, out_path, label=None, loc=None):
     return os.fspath(out_path), run_dt
 
 
-def extract(model, lat, lon, run_time, fxx, out_path, label=None, loc=None,
-            cache_root=None, progress=None):
-    """Acquire/cache one model hour in Rust and export its point sounding."""
-    model = str(model).lower()
-    if model not in SUPPORTED_MODELS:
-        raise RetrievalError(f"Rusty Weather does not support model {model!r}")
-    binaries = find_binaries()
-    if binaries is None:
-        raise RetrievalError("Rusty Weather executables are not installed")
-    ingest, exporter = binaries
-    cache_root = Path(cache_root) if cache_root else default_cache_root()
-    if out_path is None:
-        out_path = "%s_point_%.2fN_%.2fE_%s_f%03d.npz" % (
-            model.replace("-", "_"), float(lat), float(lon),
-            run_time.strftime("%Y%m%d%H"), int(fxx))
-    _report(progress, "Checking native model cache", 5)
-    try:
-        hour_path = _ensure_hour(
-            ingest, cache_root, model, run_time, fxx, progress=progress)
-    finally:
-        # `.rws` is the durable model cache.  Provider GRIB is only an ingest
-        # artifact and must not accumulate alongside it, including when a
-        # just-published/missing cycle makes ingestion fail partway through.
-        _discard_raw_downloads(cache_root)
-    prune_store(cache_root, preserve=hour_path.parent.resolve())
-
+def _export_cached_point(exporter, cache_root, model, run_time, fxx, lat, lon,
+                         out_path, label=None, loc=None, progress=None,
+                         cancelled=None):
+    """Export one already-cached ``.rws`` hour through the JSON bridge."""
     fd, bridge_path = tempfile.mkstemp(suffix=".json", prefix="sharpmod-rust-")
     os.close(fd)
     try:
@@ -337,8 +381,99 @@ def extract(model, lat, lon, run_time, fxx, out_path, label=None, loc=None,
             "--lon", repr(float(lon)),
             "--output", bridge_path,
         ]
-        _run_command(command, "Rusty Weather point-sounding export")
+        _run_command(
+            command, "Rusty Weather point-sounding export",
+            cancelled=cancelled)
         _report(progress, "Converting sounding for SHARPpy", 84)
         return json_to_npz(bridge_path, out_path, label=label, loc=loc)
     finally:
         _quiet_remove(bridge_path)
+
+
+def extract_cached(model, lat, lon, run_time, fxx, out_path, label=None,
+                   loc=None, cache_root=None, progress=None, cancelled=None):
+    """Export an exact native cache hit without initiating network I/O."""
+    model = str(model).lower()
+    if model not in SUPPORTED_MODELS:
+        raise RetrievalError(f"Rusty Weather does not support model {model!r}")
+    binaries = find_binaries()
+    if binaries is None:
+        raise RetrievalError("Rusty Weather executables are not installed")
+    _ingest, exporter = binaries
+    cache_root = Path(cache_root) if cache_root else default_cache_root()
+    if out_path is None:
+        out_path = "%s_point_%.2fN_%.2fE_%s_f%03d.npz" % (
+            model.replace("-", "_"), float(lat), float(lon),
+            run_time.strftime("%Y%m%d%H"), int(fxx))
+    _report(progress, "Checking native model cache", 5)
+    hour_path = _hour_path(cache_root, model, run_time, fxx)
+    if not hour_path.is_file():
+        raise RustCacheMiss(
+            f"native model hour is not cached: {model} {_run_id(run_time)} "
+            f"F{int(fxx):03d}")
+    _report(progress, "Using cached model hour", 60)
+    prune_store(cache_root, preserve=hour_path.parent.resolve())
+    return _export_cached_point(
+        exporter, cache_root, model, run_time, fxx, lat, lon, out_path,
+        label=label, loc=loc, progress=progress, cancelled=cancelled)
+
+
+def cache_hour(model, run_time, fxx, cache_root=None, progress=None,
+               cancelled=None):
+    """Build and retain one exact native model-hour cache without exporting.
+
+    This is the explicit map-browsing path used by the GUI's **Cache This
+    Hour** action.  It deliberately performs the larger full-hour ingest, but
+    does not create a throwaway point sounding.  Once complete,
+    :func:`extract_cached` can serve any map point from the resulting ``.rws``
+    file without another provider request.
+    """
+    model = str(model).lower()
+    if model not in SUPPORTED_MODELS:
+        raise RetrievalError(f"Rusty Weather does not support model {model!r}")
+    binaries = find_binaries()
+    if binaries is None:
+        raise RetrievalError("Rusty Weather executables are not installed")
+    ingest, _exporter = binaries
+    cache_root = Path(cache_root) if cache_root else default_cache_root()
+    try:
+        hour_path = _ensure_hour(
+            ingest, cache_root, model, run_time, fxx, progress=progress,
+            cancelled=cancelled)
+    finally:
+        # The durable cache is the decoded .rws file, not the source GRIB.
+        # This also clears partial provider artifacts after cancellation or a
+        # not-yet-published run fails.
+        _discard_raw_downloads(cache_root)
+    prune_store(cache_root, preserve=hour_path.parent.resolve())
+    _report(progress, "Model hour ready for fast map browsing", 100)
+    return hour_path
+
+
+def extract(model, lat, lon, run_time, fxx, out_path, label=None, loc=None,
+            cache_root=None, progress=None, cancelled=None):
+    """Build a full-hour native cache when needed, then export one point.
+
+    This deliberately expensive path is used only when Rust is explicitly
+    forced or after the optimized point/subregion providers fail.  Interactive
+    ``auto`` mode calls :func:`extract_cached` first instead.
+    """
+    model = str(model).lower()
+    if model not in SUPPORTED_MODELS:
+        raise RetrievalError(f"Rusty Weather does not support model {model!r}")
+    binaries = find_binaries()
+    if binaries is None:
+        raise RetrievalError("Rusty Weather executables are not installed")
+    _ingest, exporter = binaries
+    cache_root = Path(cache_root) if cache_root else default_cache_root()
+    if out_path is None:
+        out_path = "%s_point_%.2fN_%.2fE_%s_f%03d.npz" % (
+            model.replace("-", "_"), float(lat), float(lon),
+            run_time.strftime("%Y%m%d%H"), int(fxx))
+    _report(progress, "Checking native model cache", 5)
+    cache_hour(
+        model, run_time, fxx, cache_root=cache_root, progress=progress,
+        cancelled=cancelled)
+    return _export_cached_point(
+        exporter, cache_root, model, run_time, fxx, lat, lon, out_path,
+        label=label, loc=loc, progress=progress, cancelled=cancelled)

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sharpmod"
-version = "0.2.1"
-description = "SHARPpy Reimagined vRust: Rust-accelerated model soundings and analytic ECAPE with a Qt6 SHARPpy-style GUI."
+dynamic = ["version"]
+description = "SHARPpy Reimagined vRust: Rust-first sounding analysis and model ingest with a Qt6 SHARPpy-style GUI."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "BSD-3-Clause" }
@@ -53,6 +53,9 @@ dependencies = [
     # MetPy supports the cross-platform analytic ECAPE fallback and the wider
     # derived-parameter calculation stack.
     "metpy>=1.5,<2.0",
+    # Upstream's ECAPE_FUNCTIONS-compatible oracle remains available for
+    # agreement tests and the pure-Python analytic path.
+    "ecape>=0.1,<1.0",
     # ecape-parcel-py is the numerical fallback/oracle for the bundled
     # standalone ecape-rs analytic accelerator.
     "ecape-parcel>=1.2.2,<2.0",
@@ -67,10 +70,13 @@ Issues = "https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust/issues"
 [project.optional-dependencies]
 # ERA5 / GRIB point-sounding extraction tooling (optional install extra).
 era5 = [
+    "cdsapi>=0.7.7,<0.8",
     "herbie-data>=2026.3,<2027.0",
     "cfgrib>=0.9.15,<0.10",
     "eccodes>=2.47,<3.0",
     "xarray>=2026.4,<2027.0",
+    "numcodecs>=0.11,<1.0",
+    "pyproj>=3.5,<4.0",
 ]
 # WRF-ARW (wrfout NetCDF) point-sounding extraction tooling (optional extra).
 wrf = [
@@ -119,7 +125,12 @@ packages = [
     "sharpmod.resources.fonts",
 ]
 
+[tool.setuptools.dynamic]
+version = { attr = "sharpmod._version.__version__" }
+
 [tool.setuptools.package-data]
+# Platform-specific abi3 extension produced by ``sharpmod-native``.
+"sharpmod" = ["sharpmod_native*.pyd", "sharpmod_native*.so"]
 # Bundle the TTF fonts as package data so they resolve via importlib.resources
 # (never absolute paths) — Requirements 15.1, 15.2.
 "sharpmod.resources.fonts" = ["*.ttf"]

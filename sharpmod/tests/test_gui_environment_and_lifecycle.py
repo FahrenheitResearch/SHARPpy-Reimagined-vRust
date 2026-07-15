@@ -57,7 +57,7 @@ def test_uwyo_worker_is_cleared_and_deleted_on_finish():
 def test_model_worker_is_cleared_before_qt_deletes_it():
     picker = _PickerDouble("_model_worker")
 
-    PickerWindow._on_model_worker_finished(picker)
+    PickerWindow._on_model_fetch_finished(picker)
 
     assert picker._model_worker is None
     assert picker.busy_updates == [False]
@@ -156,15 +156,40 @@ def test_model_busy_state_does_not_install_global_wait_cursor():
     assert "restoreOverrideCursor" not in source
 
 
-def test_live_gui_installs_surface_lane_and_final_label_overlay():
-    source = inspect.getsource(_ensure_setup)
-    assert source.index("_install_skewt_surface_padding") < source.index(
-        "_install_skewt_sfc_label_mask")
-    assert source.index("_install_skewt_sfc_label_mask") < source.index(
-        "_install_skewt_surface_label_overlay")
+def test_live_gui_installs_the_ordered_render_patch_registry(monkeypatch):
+    from sharpmod import gui_viewer
+
+    calls = []
+    app = object()
+
+    class Renderer:
+        @staticmethod
+        def install_font(value):
+            calls.append(("font", value))
+
+        @staticmethod
+        def _apply_sars_match_color():
+            calls.append(("sars", None))
+
+        @staticmethod
+        def install_render_patches():
+            calls.append(("patches", None))
+
+    monkeypatch.setattr(gui_viewer, "_render", lambda: Renderer)
+    monkeypatch.setattr(gui_viewer, "_setup_done", False)
+
+    _ensure_setup(app)
+
+    assert calls == [
+        ("font", app),
+        ("sars", None),
+        ("patches", None),
+    ]
 
 
 def test_in_place_model_refresh_updates_index_board(monkeypatch):
+    from sharpmod.viz import SPCWindow as spc_window
+
     calls = []
 
     class Board:
@@ -173,20 +198,13 @@ def test_in_place_model_refresh_updates_index_board(monkeypatch):
 
     prof = object()
     derived = object()
-    collection = object()
-    win = type("Win", (), {})()
-    win.sharpmod_products = type("Products", (), {
-        "composite": Board(),
-        "thermo": None,
-        "kinematic": None,
-        "streamwiseness": None,
+    sw = type("SPCWidget", (), {
+        "default_prof": prof,
+        "index_board": Board(),
     })()
-    monkeypatch.setattr(
-        "sharpmod.gui._prepare_display_profile",
-        lambda value: (prof, derived) if value is collection else None,
-    )
+    monkeypatch.setattr(spc_window, "_derived_profile", lambda value: derived)
 
-    PickerWindow._refresh_mounted_model_products(win, collection)
+    spc_window._refresh_mounted_products(sw)
 
     assert calls == [(prof, derived)]
 

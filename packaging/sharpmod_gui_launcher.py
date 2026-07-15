@@ -22,17 +22,42 @@ def _model_fetch_runtime_check(output_path: str) -> int:
         "frozen": bool(getattr(sys, "frozen", False)),
     }
     try:
+        from logging.handlers import RotatingFileHandler
+
+        import cdsapi
         import cfgrib
         import ecape_parcel
         import eccodes
         import herbie
+        import numcodecs
+        import pyproj
         import xarray
 
+        from sharpmod import sharpmod_native
         from sharpmod.sharptab import native_ecape
+        from sharpmod.gui import main as gui_main
         from sharpmod.tools import model_extract
         from sharpmod.tools import rusty_weather
 
         native_ecape_available = native_ecape.available()
+        sharpmod_native_probe = bool(sharpmod_native.runtime_check())
+        sharpmod_native_info = dict(sharpmod_native.backend_info())
+        if sharpmod_native_info.get("schema") != "sharpmod.native-analysis.v1":
+            raise RuntimeError("bundled native analysis returned the wrong schema")
+        if sharpmod_native.__version__ != "0.3.2":
+            raise RuntimeError(
+                "bundled native analysis version does not match the app")
+        sharpmod_analysis_probe = sharpmod_native.analyze(
+            [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200],
+            [100, 800, 1500, 3000, 4200, 5600, 7200, 9200, 10500, 12000],
+            [30, 24, 18, 6, -2, -12, -24, -40, -49, -58],
+            [22, 18, 12, 0, -8, -18, -32, -45, -55, -65],
+            [180, 185, 195, 210, 220, 230, 240, 250, 255, 260],
+            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55],
+            latitude=35.0,
+        )
+        if sharpmod_analysis_probe.get("schema") != "sharpmod.native-analysis.v1":
+            raise RuntimeError("bundled native analysis failed its sounding probe")
         rusty_weather_available = rusty_weather.is_available("hrrr")
         configured_models = len(model_extract.available_models())
         if configured_models < 1:
@@ -60,17 +85,27 @@ def _model_fetch_runtime_check(output_path: str) -> int:
                 )
 
         result.update(
+            cdsapi=bool(cdsapi.Client),
             cfgrib=cfgrib.__version__,
             ecape_parcel=getattr(ecape_parcel, "__version__", "installed"),
             eccodes=eccodes.codes_get_api_version(),
             herbie=herbie.__version__,
+            numcodecs=numcodecs.__version__,
+            pyproj=pyproj.__version__,
             xarray=xarray.__version__,
             configured_models=configured_models,
             native_ecape=native_ecape_available,
             native_ecape_probe=native_ecape_probe is not None,
+            sharpmod_native=True,
+            sharpmod_native_probe=sharpmod_native_probe,
+            sharpmod_native_analysis_probe=True,
+            sharpmod_native_version=sharpmod_native.__version__,
+            sharpmod_native_engine=sharpmod_native_info.get("sharppyrs_revision"),
             rusty_weather=rusty_weather_available,
             ecape_fallback=not native_ecape_available,
             model_fetch_fallback=not rusty_weather_available,
+            logging_handlers=bool(RotatingFileHandler),
+            gui_entrypoint=callable(gui_main),
             ok=True,
         )
     except BaseException as exc:  # noqa: BLE001 - diagnostics must be recorded

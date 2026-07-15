@@ -130,6 +130,43 @@ def test_failed_ingest_does_not_leave_raw_grib(monkeypatch, tmp_path):
     assert not raw.exists()
 
 
+def test_cache_hour_builds_durable_rws_without_exporting_point(
+        monkeypatch, tmp_path):
+    run = datetime(2026, 7, 14, 0, tzinfo=timezone.utc)
+    hour = tmp_path / "store" / "hrrr" / "20260714_00z" / "f004.rws"
+    raw = tmp_path / "downloads" / "provider" / "fetch.grib2"
+    events = []
+
+    def ensure_hour(
+            ingest, cache_root, model, run_time, fxx, progress=None,
+            cancelled=None):
+        assert ingest == "rw_ingest"
+        assert cache_root == tmp_path
+        assert (model, run_time, fxx) == ("hrrr", run, 4)
+        assert cancelled is None
+        hour.parent.mkdir(parents=True)
+        hour.write_bytes(b"native hour")
+        raw.parent.mkdir(parents=True)
+        raw.write_bytes(b"temporary grib")
+        return hour
+
+    monkeypatch.setattr(
+        rusty_weather, "find_binaries",
+        lambda: ("rw_ingest", "rw_sharpmod"))
+    monkeypatch.setattr(rusty_weather, "_ensure_hour", ensure_hour)
+
+    result = rusty_weather.cache_hour(
+        "hrrr", run, 4, cache_root=tmp_path,
+        progress=lambda message, percent: events.append((message, percent)),
+    )
+
+    assert result == hour
+    assert hour.read_bytes() == b"native hour"
+    assert not raw.exists()
+    assert events[-1] == (
+        "Model hour ready for fast map browsing", 100)
+
+
 def test_store_pruning_preserves_active_run(monkeypatch, tmp_path):
     monkeypatch.setenv("SHARPMOD_RUST_CACHE_GB", "0.00000001")
     old_run = tmp_path / "store" / "hrrr" / "old"

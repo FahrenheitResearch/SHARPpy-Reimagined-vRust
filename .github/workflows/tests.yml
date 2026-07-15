@@ -1,13 +1,15 @@
 name: Tests
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  SHARPPYRS_REV: 958bcd685b1e28b8fce0ab5c7b8daea3cdd993aa
 
 jobs:
   pytest:
@@ -26,6 +28,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Check out pinned SHARPpyRS
+        uses: actions/checkout@v7
+        with:
+          repository: FahrenheitResearch/sharppyrs
+          ref: ${{ env.SHARPPYRS_REV }}
+          path: native/sharppyrs
+
+      - name: Apply v0.3.1 ECAPE upper-bound fix
+        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
 
       - name: Install Qt runtime libraries
         run: |
@@ -48,6 +60,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and install bulk native analysis
+        run: |
+          cargo build --release --locked --manifest-path native/sharpmod-native/Cargo.toml
+          python packaging/install_native_extension.py
+          python -c "from sharpmod import sharpmod_native as n; assert n.runtime_check(); assert n.__version__ == '0.3.2'"
 
       - name: Install package and test dependencies
         run: |

@@ -1,0 +1,21 @@
+[package]
+name = "sharpmod-native"
+version = "0.3.2"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "Bulk native sounding-analysis bridge for SHARPpy Reimagined vRust"
+
+[lib]
+name = "sharpmod_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
+sharppyrs = { path = "../sharppyrs" }
+ecape-rs = { git = "https://github.com/FahrenheitResearch/ecape-rs", rev = "82922534c02a888e773c50463b5a49d535606276" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

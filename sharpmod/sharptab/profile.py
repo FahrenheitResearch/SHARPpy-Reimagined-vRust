@@ -423,6 +423,59 @@ def derived_profile_from(prof, *, warm=()):
             except Exception:
                 pass
 
+    native = getattr(prof, "_sharpmod_native_analysis", None)
+    if isinstance(native, dict) and isinstance(native.get("derived"), dict):
+        values = native["derived"]
+        mapping = {
+            "srh500": "srh500",
+            "shear_sfc_500m": "sfc_500m_shear",
+            "mean_wind_sfc_500m": "mean_wind_sfc_500m",
+            "srw_sfc_500m": "srw_sfc_500m",
+            "dcp": "dcp",
+            "lapserate_sfc_1km": "lapserate_sfc_1km",
+            "lapserate_sfc_500m": "lapserate_sfc_500m",
+            "vgp": "vgp",
+            "wbz_height": "wbz_height",
+            "ecape": "ecape",
+            "lrghail": "lrghail",
+            "peskov": "peskov",
+            "mcs_index": "mcs_index",
+            "lscp": "lscp",
+            "nstp": "nstp",
+            "modified_sherbe": "modified_sherbe",
+            "ehi_0_1km": "ehi_0_1km",
+            "ehi_0_3km": "ehi_0_3km",
+            "hgz_cape": "hgz_cape",
+            "cape_0_6km": "cape_0_6km",
+            "ncape": "ncape",
+        }
+        native_fields = set()
+        for attr, source in mapping.items():
+            if source not in values:
+                continue
+            value = values[source]
+            if is_missing(value):
+                # Keep the lazy Python fallback for Rust inputs that are
+                # genuinely unavailable (notably NSTP without point vorticity).
+                continue
+            derived.__dict__[attr] = _clamp_to_range(attr, value)
+            native_fields.add(attr)
+        if "nstp" not in native_fields:
+            meta = getattr(derived, "meta", {}) or {}
+            vorticity_keys = (
+                "sfc_relative_vorticity", "surface_relative_vorticity",
+                "sfc_vorticity", "surface_vorticity", "vorticity",
+            )
+            if not any(
+                    key in meta and np.isfinite(float(meta[key]))
+                    for key in vorticity_keys):
+                # A bare sounding cannot define NSTP. Cache that fact instead
+                # of constructing a second Python ConvectiveProfile only to
+                # rediscover the missing external point-vorticity input.
+                derived.__dict__["nstp"] = MISSING
+        derived._sharpmod_calculation_backend = "sharppyrs/sharprs"
+        derived._sharpmod_native_fields = frozenset(native_fields)
+
     for name in warm:
         if name in DERIVED_ATTRS:
             getattr(derived, name, None)

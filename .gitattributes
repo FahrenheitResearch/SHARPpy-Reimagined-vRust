@@ -8,7 +8,15 @@
 *.cfg   text eol=lf
 *.txt   text eol=lf
 *.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.sh    text eol=lf
+*.ps1   text eol=lf
 *.bat   text eol=crlf
+*.cmd   text eol=crlf
+# Unified-diff context uses a single leading space for blank context lines.
+# Treat those syntax lines as data rather than trailing-whitespace errors.
+*.patch text eol=lf -whitespace
 
 # Binary assets (never touched / diffed as text)
 *.png   binary

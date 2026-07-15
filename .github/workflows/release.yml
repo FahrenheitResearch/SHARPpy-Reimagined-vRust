@@ -7,16 +7,19 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (for example v0.2.1)"
+        description: "Release tag to publish (for example v0.3.2)"
         required: true
-        default: "v0.2.1"
+        default: "v0.3.2"
 
 permissions:
   contents: write
 
 env:
   APP_NAME: SHARPpy-Reimagined-vRust
-  RUSTY_WEATHER_REV: 7c3db1bf25e5d37b751b168c9510b48579d59d83
+  # Rusty Weather v0.4.0. The three packaged SHARPmod helper CLIs are
+  # byte-for-byte source-compatible with the previous bridge revision.
+  RUSTY_WEATHER_REV: d656e5bdc0330142d9295be480f9efcb1d08c095
+  SHARPPYRS_REV: 958bcd685b1e28b8fce0ab5c7b8daea3cdd993aa
 
 jobs:
   release-meta:
@@ -41,7 +44,7 @@ jobs:
       - name: Validate tag matches package version
         shell: bash
         run: |
-          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          version="$(python -c 'import runpy; print(runpy.run_path("sharpmod/_version.py")["__version__"])')"
           tag="${{ steps.tag.outputs.tag }}"
           if [ "$tag" != "v$version" ]; then
             echo "::error::Release tag $tag does not match package version $version"
@@ -64,6 +67,17 @@ jobs:
           repository: FahrenheitResearch/rusty-weather
           ref: ${{ env.RUSTY_WEATHER_REV }}
           path: native/rusty-weather
+
+      - name: Check out pinned SHARPpyRS
+        uses: actions/checkout@v7
+        with:
+          repository: FahrenheitResearch/sharppyrs
+          ref: ${{ env.SHARPPYRS_REV }}
+          path: native/sharppyrs
+
+      - name: Apply v0.3.1 ECAPE upper-bound fix
+        shell: bash
+        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -93,6 +107,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Build and install bulk native analysis
+        run: |
+          cargo build --release --locked --manifest-path native/sharpmod-native/Cargo.toml
+          python packaging/install_native_extension.py
+          python -c "from sharpmod import sharpmod_native as n; assert n.runtime_check(); assert n.__version__ == '0.3.2'"
+
       - name: Install package and build dependencies
         run: |
           python -m pip install --upgrade pip
@@ -119,8 +139,14 @@ jobs:
             throw "Frozen runtime check failed"
           }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or -not $result.native_ecape -or `
-              -not $result.rusty_weather -or $result.configured_models -lt 1) {
+          if (-not $result.ok -or -not $result.sharpmod_native -or `
+              -not $result.sharpmod_native_probe -or `
+              -not $result.sharpmod_native_analysis_probe -or `
+              $result.sharpmod_native_version -ne "0.3.2" -or `
+              -not $result.native_ecape -or `
+              -not $result.native_ecape_probe -or -not $result.rusty_weather -or `
+              -not $result.logging_handlers -or -not $result.gui_entrypoint -or `
+              $result.configured_models -lt 1) {
             $result | ConvertTo-Json
             throw "Frozen runtime report is invalid"
           }
@@ -130,6 +156,32 @@ jobs:
         env:
           SHARPMOD_ONEFILE: "1"
         run: pyinstaller packaging/sharpmod_gui.spec --noconfirm
+
+      - name: Verify frozen single-file runtime
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "single-file-runtime.json"
+          $process = Start-Process `
+            -FilePath "dist/$env:APP_NAME.exe" `
+            -ArgumentList "--model-fetch-runtime-check", $report `
+            -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path $report) { Get-Content $report }
+            throw "Frozen single-file runtime check failed"
+          }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          if (-not $result.ok -or -not $result.sharpmod_native -or `
+              -not $result.sharpmod_native_probe -or `
+              -not $result.sharpmod_native_analysis_probe -or `
+              $result.sharpmod_native_version -ne "0.3.2" -or `
+              -not $result.native_ecape -or `
+              -not $result.native_ecape_probe -or -not $result.rusty_weather -or `
+              -not $result.logging_handlers -or -not $result.gui_entrypoint -or `
+              $result.configured_models -lt 1) {
+            $result | ConvertTo-Json
+            throw "Frozen single-file runtime report is invalid"
+          }
+          $result | ConvertTo-Json
 
       - name: Package Windows builds
         shell: pwsh
@@ -174,6 +226,16 @@ jobs:
           ref: ${{ env.RUSTY_WEATHER_REV }}
           path: native/rusty-weather
 
+      - name: Check out pinned SHARPpyRS
+        uses: actions/checkout@v7
+        with:
+          repository: FahrenheitResearch/sharppyrs
+          ref: ${{ env.SHARPPYRS_REV }}
+          path: native/sharppyrs
+
+      - name: Apply v0.3.1 ECAPE upper-bound fix
+        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+
       - name: Install Linux runtime libraries
         run: |
           sudo apt-get update
@@ -217,6 +279,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Build and install bulk native analysis
+        run: |
+          cargo build --release --locked --manifest-path native/sharpmod-native/Cargo.toml
+          python packaging/install_native_extension.py
+          python -c "from sharpmod import sharpmod_native as n; assert n.runtime_check(); assert n.__version__ == '0.3.2'"
+
       - name: Install package and build dependencies
         run: |
           python -m pip install --upgrade pip
@@ -242,8 +310,15 @@ jobs:
           import json, sys
           result = json.load(open(sys.argv[1], encoding="utf-8"))
           assert result["ok"]
+          assert result["sharpmod_native"]
+          assert result["sharpmod_native_probe"]
+          assert result["sharpmod_native_analysis_probe"]
+          assert result["sharpmod_native_version"] == "0.3.2"
           assert result["native_ecape"]
+          assert result["native_ecape_probe"]
           assert result["rusty_weather"]
+          assert result["logging_handlers"]
+          assert result["gui_entrypoint"]
           assert result["configured_models"] >= 1
           print(json.dumps(result, indent=2, sort_keys=True))
           PY
@@ -254,6 +329,29 @@ jobs:
         run: >-
           pyinstaller packaging/sharpmod_gui.spec --noconfirm
           --distpath dist/onefile --workpath build/onefile
+
+      - name: Verify frozen single-file runtime
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          report="$RUNNER_TEMP/single-file-runtime.json"
+          "dist/onefile/$APP_NAME" --model-fetch-runtime-check "$report"
+          python - "$report" <<'PY'
+          import json, sys
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert result["ok"]
+          assert result["sharpmod_native"]
+          assert result["sharpmod_native_probe"]
+          assert result["sharpmod_native_analysis_probe"]
+          assert result["sharpmod_native_version"] == "0.3.2"
+          assert result["native_ecape"]
+          assert result["native_ecape_probe"]
+          assert result["rusty_weather"]
+          assert result["logging_handlers"]
+          assert result["gui_entrypoint"]
+          assert result["configured_models"] >= 1
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
 
       - name: Package Linux builds
         run: |
@@ -301,6 +399,16 @@ jobs:
           ref: ${{ env.RUSTY_WEATHER_REV }}
           path: native/rusty-weather
 
+      - name: Check out pinned SHARPpyRS
+        uses: actions/checkout@v7
+        with:
+          repository: FahrenheitResearch/sharppyrs
+          ref: ${{ env.SHARPPYRS_REV }}
+          path: native/sharppyrs
+
+      - name: Apply v0.3.1 ECAPE upper-bound fix
+        run: git -C native/sharppyrs apply ../patches/sharppyrs-ecape-el.patch
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -325,6 +433,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Build and install bulk native analysis
+        run: |
+          cargo build --release --locked --manifest-path native/sharpmod-native/Cargo.toml
+          python packaging/install_native_extension.py
+          python -c "from sharpmod import sharpmod_native as n; assert n.runtime_check(); assert n.__version__ == '0.3.2'"
+
       - name: Install package and build dependencies
         run: |
           python -m pip install --upgrade pip
@@ -348,8 +462,15 @@ jobs:
           import json, sys
           result = json.load(open(sys.argv[1], encoding="utf-8"))
           assert result["ok"]
+          assert result["sharpmod_native"]
+          assert result["sharpmod_native_probe"]
+          assert result["sharpmod_native_analysis_probe"]
+          assert result["sharpmod_native_version"] == "0.3.2"
           assert result["native_ecape"]
+          assert result["native_ecape_probe"]
           assert result["rusty_weather"]
+          assert result["logging_handlers"]
+          assert result["gui_entrypoint"]
           assert result["configured_models"] >= 1
           print(json.dumps(result, indent=2, sort_keys=True))
           PY

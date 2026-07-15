@@ -107,7 +107,8 @@ class Decoder(object):
         prof_col = self._prof_collection
         if indexes is not None:
             prof_col = prof_col.subset(indexes)
-        return prof_col
+        from sharpmod.sharptab.native_profile import configure_profile_collection
+        return configure_profile_collection(prof_col)
 
     def getStnId(self):
         """Return the station identifier / location metadata."""
@@ -235,7 +236,8 @@ def _sanitize_profile_collection(prof_col):
         for prof in profs:
             _sanitize_profile_rows(prof)
             _thin_profile_rows(prof)
-    return prof_col
+    from sharpmod.sharptab.native_profile import configure_profile_collection
+    return configure_profile_collection(prof_col)
 
 
 def _wrap_spc_decoder():
@@ -337,7 +339,9 @@ def load_npz(filename):
             optional_surface_fields[key] = value
             setattr(prof, key, value)
 
-    pc = prof_collection.ProfCollection({"": [prof]}, [valid])
+    from sharpmod.sharptab.native_profile import target_profile_type
+    pc = prof_collection.ProfCollection(
+        {"": [prof]}, [valid], target_type=target_profile_type())
     pc.setMeta("loc", loc)
     pc.setMeta("observed", False)
     pc.setMeta("base_time", run)

@@ -86,6 +86,16 @@ LCL pressure is then obtained by lifting dry adiabatically to $T_{LCL}$, and the
 
 The level of free convection (LFC) is the first level above the LCL where the parcel becomes positively buoyant. The equilibrium level (EL) is the later crossing where positive buoyancy ends. Both crossings use the parcel and environmental virtual-temperature traces from the upstream parcel integration.
 
+### Maximum Parcel Level (MPL)
+
+The maximum parcel level is the height above the equilibrium level where the
+parcel's accumulated negative buoyancy has consumed the positive energy gained
+below the EL. In the upstream parcel integration, the search continues above
+the EL until the integrated negative area equals the parcel's CAPE. The result
+is stored as `mplpres` and `mplhght`; the GUI shows MPL both beside the Skew-T
+and in the main parcel table. MPL can be missing when the sounding does not
+extend high enough for the energy balance to be reached.
+
 ### Lifted Index
 
 The displayed lifted index is the environmental virtual temperature minus the lifted parcel virtual temperature at 500 hPa:
@@ -562,11 +572,16 @@ Both are reported in J/kg/m. NCIN remains negative.
 
 ### Entraining CAPE (ECAPE)
 
-The displayed ECAPE calculation uses the Peters-style analytic expression. On
-Windows the bundled standalone `ecape-rs` solver is the normal fast path;
-`ecape-parcel-py` computes the same analytic diagnostic as the cross-platform
-fallback and numerical reference. A final local implementation remains
-available if neither external path can resolve the profile.
+The displayed ECAPE calculation uses the Peters-style analytic expression. In
+vRust builds, the `sharpmod_native` extension calls `ecape-rs` in-process on
+Windows, Linux, and macOS and records `ecape-rs` in the native result's
+provenance. NCAPE work is limited to the equilibrium level so unused
+upper-stratospheric saturation states are never evaluated.
+
+If the full native analysis extension cannot load or rejects a profile, the
+compatible Python profile remains available. Its ECAPE chain tries the bundled
+standalone `ecape-rs` solver where present, then `ecape-parcel-py` as the
+cross-platform analytic reference, then the local term-by-term implementation.
 
 ```math
 a=\frac{\psi}{V_{SR}^{2}},
@@ -628,6 +643,7 @@ Colors are presentation cues, not additional scientific thresholds. Missing valu
 | CAPE | White below 1000; yellow at 1000; red at 2500; pink at 4000 J/kg. Requires positive CAPE. |
 | CIN | Green at -50 J/kg or greater; orange from -100 to less than -50; red below -100. |
 | LCL | Neutral white; the available generic LCL helper is not called by this table. |
+| LFC / EL / MPL | Neutral white heights; missing levels display as `--`. |
 | LI | White above -4; yellow at -4 or lower; red at -7 or lower; pink at -10 or lower. Requires positive CAPE. |
 | 3CAPE / 6CAPE | Green above 25; yellow above 50; orange above 75; red above 100; magenta above 125 J/kg. |
 
