@@ -440,6 +440,8 @@ jobs:
           cache: pip
 
       - name: Build and install bulk native analysis
+        env:
+          RUSTFLAGS: "-C link-arg=-undefined -C link-arg=dynamic_lookup"
         run: |
           cargo build --release --locked --manifest-path native/sharpmod-native/Cargo.toml
           python packaging/install_native_extension.py
