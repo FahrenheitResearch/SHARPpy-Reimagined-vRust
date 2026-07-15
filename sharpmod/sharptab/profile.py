@@ -455,6 +455,22 @@ def derived_profile_from(prof, *, warm=()):
                 continue
             value = values[source]
             if is_missing(value):
+                if attr == "modified_sherbe":
+                    # MOSHE requires an OMEGA profile. Rusty Weather point
+                    # exports intentionally use the missing sentinel when the
+                    # cached model store has no vertical-velocity field.  The
+                    # Python implementation reaches the same missing result,
+                    # but only after constructing an entire legacy
+                    # ConvectiveProfile (~200 ms per map click). Cache the
+                    # mathematically undefined result instead of repeating
+                    # that work.
+                    omega = ma.asarray(getattr(prof, "omeg", ()))
+                    valid_omega = np.asarray(omega.compressed(), dtype=float)
+                    if not np.any(
+                            np.isfinite(valid_omega)
+                            & (valid_omega > -9000.0)):
+                        derived.__dict__[attr] = MISSING
+                        continue
                 # Keep the lazy Python fallback for Rust inputs that are
                 # genuinely unavailable (notably NSTP without point vorticity).
                 continue

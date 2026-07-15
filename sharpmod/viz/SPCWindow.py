@@ -145,7 +145,21 @@ def _install_streamwiseness_hooks():
     original_update = cls.updateProfs
 
     def toggleVector(self, deviant):  # noqa: N802 - upstream Qt API
+        # ``updateProfs`` always reapplies the latitude-default vector even
+        # when it is already selected.  Every vendored ``setDeviant`` performs
+        # a synchronous clear/plot/update, so that harmless right->right (or
+        # left->left) assignment used to redraw the Skew-T, hodograph, slinky,
+        # winds and all severe panels.  Cache only successful applications;
+        # real manual switches and profiles crossing hemispheres still take
+        # the complete upstream path.
+        if getattr(self, "_sharpmod_deviant", None) == deviant:
+            try:
+                self.setFocus()
+            except Exception:
+                pass
+            return None
         result = original_toggle(self, deviant)
+        self._sharpmod_deviant = deviant
         chart = getattr(self, "streamwiseness", None)
         if chart is not None:
             try:
@@ -161,8 +175,37 @@ def _install_streamwiseness_hooks():
         return result
 
     def updateProfs(self):  # noqa: N802 - upstream Qt API
+        # The vendored update draws the Skew-T while applying the newly
+        # focused parcel.  Put the matching derived profile on the widget
+        # *before* that draw so the CAPE/HGZ overlay wrappers consume current
+        # data in the same pass.  Previously ``_refresh_mounted_products`` did
+        # this only afterwards and had to clear/plot/update the entire Skew-T
+        # a second time.
+        staged_prof = None
+        staged_derived = None
+        staged_sound = False
+        try:
+            prof_col = self.prof_collections[self.pc_idx]
+            staged_prof = prof_col.getHighlightedProf()
+            staged_derived = _derived_profile(staged_prof)
+            sound = getattr(self, "sound", None)
+            if sound is not None:
+                sound._sharpmod_derived_profile = staged_derived
+                staged_sound = True
+        except Exception:
+            # Preserve the vendored error/fallback behaviour.  The original
+            # update below remains authoritative and the post-refresh retains
+            # its historical redraw when staging was not possible.
+            staged_prof = None
+            staged_derived = None
+            staged_sound = False
         result = original_update(self)
-        _refresh_mounted_products(self)
+        _refresh_mounted_products(
+            self,
+            prof=staged_prof,
+            derived=staged_derived,
+            redraw_sound=not staged_sound,
+        )
         return result
 
     cls.toggleVector = toggleVector
@@ -644,12 +687,22 @@ def _derived_profile(prof):
         return prof
 
 
-def _refresh_mounted_products(sw):
-    """Refresh custom products from the currently focused/recomputed profile."""
-    prof = getattr(sw, "default_prof", None)
+def _refresh_mounted_products(
+        sw, *, prof=None, derived=None, redraw_sound=True):
+    """Refresh custom products from the current profile.
+
+    ``updateProfs`` supplies a precomputed ``prof``/``derived`` pair and sets
+    ``redraw_sound=False`` because the derived profile was staged before the
+    vendored Skew-T draw.  The defaults preserve the original standalone
+    refresh contract for preference/session callers that invoke this helper
+    after a profile update.
+    """
+    if prof is None:
+        prof = getattr(sw, "default_prof", None)
     if prof is None:
         return
-    derived = _derived_profile(prof)
+    if derived is None:
+        derived = _derived_profile(prof)
 
     board = getattr(sw, "index_board", None)
     if board is not None:
@@ -668,12 +721,13 @@ def _refresh_mounted_products(sw):
     sound = getattr(sw, "sound", None)
     if sound is not None:
         sound._sharpmod_derived_profile = derived
-        try:
-            sound.clearData()
-            sound.plotData()
-            sound.update()
-        except Exception:
-            pass
+        if redraw_sound:
+            try:
+                sound.clearData()
+                sound.plotData()
+                sound.update()
+            except Exception:
+                pass
 
 
 def attach_hgz_overlay(

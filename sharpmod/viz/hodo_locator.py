@@ -1,8 +1,10 @@
 """Zoomed worldwide locator drawn over the hodograph pixmap.
 
-The locator always draws bundled Natural Earth coastlines and administrative
-boundaries.  Inside the United States it adds the existing live TIGERweb
-county outlines on top for greater local detail.
+The interactive redraw path is deliberately local-only: bundled Natural Earth
+coastlines and administrative boundaries are always available, and any county
+features previously fetched by an explicit background/non-GUI caller may be
+added from the in-process cache. A Qt paint/update call must never wait on the
+live TIGERweb service.
 """
 
 from __future__ import annotations
@@ -28,6 +30,9 @@ _GLOBAL_COASTLINE = "#b8cada"
 _COUNTY_OUTLINE = "#ffffff"
 _POINT_COLOR = "#ffda00"
 _GLOBAL_LAYER_NAMES = ("coastline", "countries", "states")
+_COUNTY_FEATURE_CACHE: dict[
+    tuple[float, float], tuple[dict[str, Any], ...]
+] = {}
 
 
 def _as_float(value: Any) -> float | None:
@@ -109,8 +114,22 @@ def _county_features_cached(lat_key: float, lon_key: float) -> tuple[dict[str, A
 
 
 def county_features_for_point(lat: float, lon: float) -> tuple[dict[str, Any], ...]:
-    """Load county outlines near a sounding, caching by approximately 1 km."""
-    return _county_features_cached(round(lat, 2), round(lon, 2))
+    """Load county outlines near a sounding outside the GUI redraw path.
+
+    This remains available for an explicit worker/prefetch caller. Results are
+    copied into a directly readable memory cache so the painter can consume
+    them without invoking any network-capable function.
+    """
+    key = (round(lat, 2), round(lon, 2))
+    if key not in _COUNTY_FEATURE_CACHE:
+        _COUNTY_FEATURE_CACHE[key] = _county_features_cached(*key)
+    return _COUNTY_FEATURE_CACHE[key]
+
+
+def cached_county_features_for_point(
+        lat: float, lon: float) -> tuple[dict[str, Any], ...]:
+    """Return already-cached county outlines without performing network I/O."""
+    return _COUNTY_FEATURE_CACHE.get((round(lat, 2), round(lon, 2)), ())
 
 
 @lru_cache(maxsize=1)
@@ -153,6 +172,30 @@ def _global_layers_cached() -> dict[
     return layers
 
 
+@lru_cache(maxsize=1)
+def _global_line_records_cached() -> dict[
+        str, tuple[
+            tuple[
+                tuple[tuple[float, float], ...],
+                float, float, float, float,
+            ], ...
+        ]]:
+    """Precompute raw bounds so a map click does not rescan every vertex."""
+    records = {}
+    for name, lines in _global_layers_cached().items():
+        records[name] = tuple(
+            (
+                line,
+                min(lon for lon, _lat in line),
+                min(lat for _lon, lat in line),
+                max(lon for lon, _lat in line),
+                max(lat for _lon, lat in line),
+            )
+            for line in lines
+        )
+    return records
+
+
 def _longitude_near(lon: float, center: float) -> float:
     """Wrap ``lon`` onto the copy of the world closest to ``center``."""
     return center + ((lon - center + 180.0) % 360.0) - 180.0
@@ -164,20 +207,27 @@ def _global_lines_for_bounds_cached(
             str, tuple[tuple[tuple[float, float], ...], ...]]:
     center = (west + east) / 2.0
     selected = {}
-    for name, lines in _global_layers_cached().items():
+    for name, records in _global_line_records_cached().items():
         matches = []
-        for line in lines:
+        for line, raw_west, line_south, raw_east, line_north in records:
+            if line_north < south or line_south > north:
+                continue
+            # Input longitudes live in [-180, 180], while a local extent may
+            # cross either edge. Reject lines whose raw bounding box (or its
+            # neighboring world copies) cannot intersect before performing
+            # the comparatively expensive per-vertex dateline adjustment.
+            if not any(
+                    raw_east + shift >= west
+                    and raw_west + shift <= east
+                    for shift in (-360.0, 0.0, 360.0)):
+                continue
             adjusted = tuple(
                 (_longitude_near(lon, center), lat) for lon, lat in line)
             line_west = min(coordinate[0] for coordinate in adjusted)
             line_east = max(coordinate[0] for coordinate in adjusted)
-            line_south = min(coordinate[1] for coordinate in adjusted)
-            line_north = max(coordinate[1] for coordinate in adjusted)
             if (
                 line_east >= west
                 and line_west <= east
-                and line_north >= south
-                and line_south <= north
             ):
                 matches.append(adjusted)
         selected[name] = tuple(matches)
@@ -259,7 +309,12 @@ def _draw_global_lines(
 
 
 def draw_hodo_locator(widget: Any) -> bool:
-    """Draw a worldwide locator, optional U.S. counties, and selected point."""
+    """Draw a worldwide locator, cached U.S. counties, and selected point.
+
+    This function runs synchronously inside hodograph ``plotData``. Keep every
+    dependency local so changing sounding locations cannot freeze Qt while a
+    remote boundary service responds.
+    """
     point = point_from_widget(widget)
     if point is None or not hasattr(widget, "plotBitMap"):
         return False
@@ -276,7 +331,7 @@ def draw_hodo_locator(widget: Any) -> bool:
     lat, lon = point
     bounds = zoom_bounds(lat, lon)
     try:
-        features = county_features_for_point(lat, lon)
+        features = cached_county_features_for_point(lat, lon)
     except Exception:
         features = ()
     try:

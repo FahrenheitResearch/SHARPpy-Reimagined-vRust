@@ -1737,7 +1737,18 @@ class PickerWindow(QMainWindow):
         """
         old_menu = getattr(self, "_model_viewer_menu", None)
         new_menu = viewer.createMenuName(prof_col)
-        if old_menu and old_menu == new_menu:
+        replace_started = time.monotonic()
+        if old_menu and PickerWindow._replace_model_profile_in_place(
+                viewer, old_menu, new_menu, prof_col):
+            _LOGGER.info(
+                "model_fetch.viewer_replace path=in_place elapsed_ms=%.1f "
+                "old_menu=%s new_menu=%s",
+                (time.monotonic() - replace_started) * 1000.0,
+                old_menu, new_menu)
+        elif old_menu and old_menu == new_menu:
+            # Test doubles and alternate SPCWindow implementations may not
+            # expose the vendored collection lists. Retain the historical
+            # fallback for those implementations.
             if not PickerWindow._replace_same_menu_model_profile(
                     viewer, old_menu, prof_col):
                 # Test doubles and alternate SPCWindow implementations may not
@@ -1751,18 +1762,27 @@ class PickerWindow(QMainWindow):
                 prof_col, focus=True, check_integrity=False)
             if old_menu:
                 viewer.rmProfileCollection(old_menu)
+            _LOGGER.info(
+                "model_fetch.viewer_replace path=add_remove elapsed_ms=%.1f "
+                "old_menu=%s new_menu=%s",
+                (time.monotonic() - replace_started) * 1000.0,
+                old_menu, new_menu)
         return viewer.createMenuName(prof_col)
 
     @staticmethod
-    def _replace_same_menu_model_profile(viewer, menu_name, prof_col) -> bool:
-        """Replace a duplicate-key profile without emptying the SPC widget.
+    def _replace_model_profile_in_place(
+            viewer, old_menu, new_menu, prof_col) -> bool:
+        """Replace and, when needed, rename one mounted model collection.
 
-        Vendored ``addProfileCollection`` treats an existing menu name as a
-        request to focus stale data, while removing the sole collection first
-        makes ``updateProfs`` index an empty list. Replace the collection in the
-        three lists maintained by SPCWidget/SkewT/Hodograph, then run the normal
-        refresh hook once. The menu and its actions remain valid because their
-        stable key did not change.
+        A map click changes the location embedded in SHARPpy's profile-menu
+        key. The old path therefore added the new collection (one full
+        ``updateProfs`` redraw) and removed the old collection (a second full
+        redraw). Replace the collection in the three synchronized lists,
+        retarget its existing menu actions, and refresh exactly once.
+
+        Return ``False`` for alternate/test SPCWindow implementations that do
+        not expose the required bookkeeping, allowing the caller to use the
+        public add/remove API instead.
         """
         sw = getattr(viewer, "spc_widget", None)
         prof_ids = getattr(sw, "prof_ids", None)
@@ -1770,10 +1790,52 @@ class PickerWindow(QMainWindow):
         if not isinstance(prof_ids, list) or not isinstance(collections, list):
             return False
         try:
-            index = prof_ids.index(menu_name)
+            index = prof_ids.index(old_menu)
             old_prof = collections[index]
         except (ValueError, IndexError):
             return False
+
+        menu_item = None
+        mapped_actions = []
+        if old_menu != new_menu:
+            menu_items = getattr(viewer, "menu_items", None)
+            focus_mapper = getattr(viewer, "focus_mapper", None)
+            remove_mapper = getattr(viewer, "remove_mapper", None)
+            if not isinstance(menu_items, list) \
+                    or focus_mapper is None or remove_mapper is None:
+                return False
+
+            # Do not rename onto another visible collection. The public API
+            # owns duplicate-key behavior and remains the safe fallback.
+            for candidate in menu_items:
+                try:
+                    if candidate.title() == new_menu \
+                            and candidate.title() != old_menu \
+                            and candidate.menuAction().isVisible():
+                        return False
+                except (AttributeError, RuntimeError):
+                    continue
+            for candidate in menu_items:
+                try:
+                    if candidate.title() == old_menu \
+                            and candidate.menuAction().isVisible():
+                        menu_item = candidate
+                        break
+                except (AttributeError, RuntimeError):
+                    continue
+            if menu_item is None:
+                return False
+
+            try:
+                for action in menu_item.actions():
+                    if action.text() == "Focus":
+                        mapped_actions.append((focus_mapper, action))
+                    elif action.text() == "Remove":
+                        mapped_actions.append((remove_mapper, action))
+            except (AttributeError, RuntimeError):
+                return False
+            if len(mapped_actions) != 2:
+                return False
 
         targets = [(collections, index)]
         for widget_name in ("sound", "hodo"):
@@ -1787,16 +1849,42 @@ class PickerWindow(QMainWindow):
                 continue
             targets.append((widget_collections, target_index))
 
+        old_pc_idx = getattr(sw, "pc_idx", 0)
         for target, target_index in targets:
             target[target_index] = prof_col
+        prof_ids[index] = new_menu
+        if menu_item is not None:
+            menu_item.setTitle(new_menu)
+            for mapper, action in mapped_actions:
+                mapper.setMapping(action, new_menu)
         sw.pc_idx = index
         try:
             sw.updateProfs()
         except Exception:
             for target, target_index in targets:
                 target[target_index] = old_prof
+            prof_ids[index] = old_menu
+            sw.pc_idx = old_pc_idx
+            if menu_item is not None:
+                menu_item.setTitle(old_menu)
+                for mapper, action in mapped_actions:
+                    mapper.setMapping(action, old_menu)
             raise
         return True
+
+    @staticmethod
+    def _replace_same_menu_model_profile(viewer, menu_name, prof_col) -> bool:
+        """Replace a duplicate-key profile without emptying the SPC widget.
+
+        Vendored ``addProfileCollection`` treats an existing menu name as a
+        request to focus stale data, while removing the sole collection first
+        makes ``updateProfs`` index an empty list. Replace the collection in the
+        three lists maintained by SPCWidget/SkewT/Hodograph, then run the normal
+        refresh hook once. The menu and its actions remain valid because their
+        stable key did not change.
+        """
+        return PickerWindow._replace_model_profile_in_place(
+            viewer, menu_name, menu_name, prof_col)
 
     def _model_point_ok(self) -> bool:
         cfg = self._model_config()

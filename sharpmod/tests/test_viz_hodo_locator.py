@@ -57,7 +57,8 @@ def test_global_boundaries_cover_international_point():
 def test_locator_draws_global_outline_when_counties_are_unavailable(
         monkeypatch, qt_app):
     monkeypatch.setattr(
-        hodo_locator, "county_features_for_point", lambda _lat, _lon: ())
+        hodo_locator, "cached_county_features_for_point",
+        lambda _lat, _lon: ())
     monkeypatch.setattr(
         hodo_locator,
         "global_lines_for_bounds",
@@ -104,7 +105,8 @@ def test_locator_draws_county_outline_and_sounding_marker(monkeypatch, qt_app):
             },
         }]
 
-    monkeypatch.setattr(hodo_locator, "county_features_for_point", features)
+    monkeypatch.setattr(
+        hodo_locator, "cached_county_features_for_point", features)
     pixmap = QPixmap(640, 480)
     pixmap.fill(QColor("black"))
     widget = SimpleNamespace(
@@ -124,3 +126,25 @@ def test_locator_draws_county_outline_and_sounding_marker(monkeypatch, qt_app):
             if color.red() > 180 and color.green() > 140 and color.blue() < 90:
                 marker_pixels += 1
     assert marker_pixels > 5
+
+
+def test_locator_redraw_never_calls_network_capable_county_loader(
+        monkeypatch, qt_app):
+    def fail_live_loader(*_args, **_kwargs):
+        raise AssertionError("GUI redraw attempted a live county request")
+
+    monkeypatch.setattr(
+        hodo_locator, "county_features_for_point", fail_live_loader)
+    monkeypatch.setattr(
+        hodo_locator, "cached_county_features_for_point",
+        lambda _lat, _lon: ())
+    pixmap = QPixmap(640, 480)
+    pixmap.fill(QColor("black"))
+    widget = SimpleNamespace(
+        plotBitMap=pixmap,
+        prof=SimpleNamespace(latitude=39.0319, longitude=-88.6713),
+        width=lambda: 640,
+        height=lambda: 480,
+    )
+
+    assert hodo_locator.draw_hodo_locator(widget) is True

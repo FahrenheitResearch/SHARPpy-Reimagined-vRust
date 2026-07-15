@@ -111,6 +111,49 @@ class _Viewer:
         self.events.append(("activate",))
 
 
+class _MenuAction:
+    def __init__(self, text):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+
+class _MenuHandle:
+    def __init__(self, visible=True):
+        self._visible = visible
+
+    def isVisible(self):  # noqa: N802
+        return self._visible
+
+
+class _ProfileMenu:
+    def __init__(self, title):
+        self._title = title
+        self._handle = _MenuHandle()
+        self._actions = [_MenuAction("Focus"), _MenuAction("Remove")]
+
+    def title(self):
+        return self._title
+
+    def setTitle(self, title):  # noqa: N802
+        self._title = title
+
+    def menuAction(self):  # noqa: N802
+        return self._handle
+
+    def actions(self):
+        return self._actions
+
+
+class _Mapper:
+    def __init__(self):
+        self.mappings = []
+
+    def setMapping(self, action, value):  # noqa: N802
+        self.mappings.append((action.text(), value))
+
+
 def test_compose_interactive_requests_deferred_native_construction():
     source = inspect.getsource(gui_viewer.compose_interactive)
     assert "defer_show=True" in source
@@ -427,6 +470,48 @@ def test_same_menu_replaces_the_sole_model_profile_in_place():
     assert sound.prof_collections == [new_model]
     assert hodo.prof_collections == [new_model]
     assert spc_widget.pc_idx == 0
+    assert updates == ["updated"]
+    assert viewer.events == []
+
+
+def test_changed_menu_replaces_model_profile_with_one_refresh():
+    observed = _Profile("Observed")
+    old_model = _Profile("Old model")
+    new_model = _Profile("New model")
+    sound = SimpleNamespace(prof_collections=[observed, old_model])
+    hodo = SimpleNamespace(prof_collections=[observed, old_model])
+    updates = []
+    spc_widget = SimpleNamespace(
+        prof_ids=["Observed", "Old model"],
+        prof_collections=[observed, old_model],
+        sound=sound,
+        hodo=hodo,
+        pc_idx=1,
+        updateProfs=lambda: updates.append("updated"),
+    )
+    viewer = _Viewer([
+        (observed.menu_name, observed),
+        (old_model.menu_name, old_model),
+    ])
+    old_menu = _ProfileMenu("Old model")
+    viewer.spc_widget = spc_widget
+    viewer.menu_items = [_ProfileMenu("Observed"), old_menu]
+    viewer.focus_mapper = _Mapper()
+    viewer.remove_mapper = _Mapper()
+    picker = SimpleNamespace(_model_viewer_menu="Old model")
+
+    result = gui_picker.PickerWindow._replace_model_profile(
+        picker, viewer, new_model)
+
+    assert result == "New model"
+    assert spc_widget.prof_ids == ["Observed", "New model"]
+    assert spc_widget.prof_collections == [observed, new_model]
+    assert sound.prof_collections == [observed, new_model]
+    assert hodo.prof_collections == [observed, new_model]
+    assert spc_widget.pc_idx == 1
+    assert old_menu.title() == "New model"
+    assert viewer.focus_mapper.mappings == [("Focus", "New model")]
+    assert viewer.remove_mapper.mappings == [("Remove", "New model")]
     assert updates == ["updated"]
     assert viewer.events == []
 

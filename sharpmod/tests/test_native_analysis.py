@@ -129,6 +129,26 @@ def test_profile_collection_and_companion_use_native_results(monkeypatch):
     assert "ecape" in companion._sharpmod_native_fields
 
 
+def test_missing_omega_moshe_does_not_build_legacy_profile(monkeypatch):
+    """Cached .rws points omit OMEGA, so MOSHE is undefined, not a fallback."""
+    from sharppy.sharptab import profile as sp_profile
+    from sharpmod.sharptab import profile as derived_profile
+    from sharpmod.sharptab.native_profile import NativeConvectiveProfile
+
+    kwargs = _kwargs()
+    kwargs["omeg"] = np.full_like(kwargs["pres"], -9999.0)
+    prof = NativeConvectiveProfile(**kwargs)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("missing OMEGA triggered a legacy full-profile build")
+
+    monkeypatch.setattr(sp_profile.ConvectiveProfile, "__init__", forbidden)
+    companion = derived_profile.derived_profile_from(
+        prof, warm=derived_profile.DISPLAY_DERIVED_ATTRS)
+
+    assert np.ma.is_masked(companion.modified_sherbe)
+
+
 def test_native_bulk_analysis_latency_contract():
     from sharppy.sharptab import profile as sp_profile
 
