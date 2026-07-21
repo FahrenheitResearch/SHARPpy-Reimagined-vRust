@@ -104,7 +104,7 @@ jobs:
           Copy-Item "$source/rw_ecape_analytic.exe" "$dest/rw_ecape_analytic.exe" -Force
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -278,7 +278,7 @@ jobs:
           install -m 755 native/rusty-weather/target/release/rw_ecape_analytic sharpmod/resources/bin/rw_ecape_analytic
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -434,7 +434,7 @@ jobs:
           install -m 755 native/rusty-weather/target/release/rw_ecape_analytic sharpmod/resources/bin/rw_ecape_analytic
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
